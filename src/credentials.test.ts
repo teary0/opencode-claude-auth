@@ -22,6 +22,23 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 
+// os.homedir() reads USERPROFILE on Windows and ignores HOME, so redirecting
+// only HOME would let these tests touch the real ~/.claude/.credentials.json.
+function setHome(dir: string): () => void {
+  const saved = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+  }
+  process.env.HOME = dir
+  process.env.USERPROFILE = dir
+  return () => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
 // Keep the cross-process refresh lock off the real OpenCode data dir during
 // tests, and isolated to this test process.
 process.env.OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_DIR = mkdtempSync(
@@ -1441,11 +1458,10 @@ describe("syncAuthJson file permissions", () => {
   it("writes auth.json with mode 0o600", async () => {
     if (process.platform === "win32") return // Windows doesn't support Unix permissions
 
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-perms-"),
     )
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const tempDir = await mkdtemp(
@@ -1530,22 +1546,17 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         `Expected file mode 0o600, got 0o${mode.toString(8)}`,
       )
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
     }
   })
 
   it("tightens permissions on pre-existing auth.json from 0o644 to 0o600", async () => {
     if (process.platform === "win32") return
 
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-perms2-"),
     )
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       // Create auth.json with permissive mode first
@@ -1631,11 +1642,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         `Expected tightened mode 0o600, got 0o${mode.toString(8)}`,
       )
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
     }
   })
 })

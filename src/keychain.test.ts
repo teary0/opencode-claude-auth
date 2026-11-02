@@ -23,6 +23,23 @@ import {
   writeBackCredentials,
 } from "./keychain.ts"
 
+// os.homedir() reads USERPROFILE on Windows and ignores HOME, so redirecting
+// only HOME would let these tests touch the real ~/.claude/.credentials.json.
+function setHome(dir: string): () => void {
+  const saved = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+  }
+  process.env.HOME = dir
+  process.env.USERPROFILE = dir
+  return () => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
 // Mirrors listClaudeKeychainServices regex logic for unit testing
 type MockedKeychain = {
   readAllClaudeAccounts: () => Array<{
@@ -320,7 +337,6 @@ describe("account labelling", () => {
 
 describe("readAllClaudeAccounts", () => {
   it("resolves suffixed keychain services back to config dirs and emails", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     const primaryDir = join(tempHome, ".claude")
     const workDir = join(tempHome, ".work")
@@ -363,7 +379,7 @@ describe("readAllClaudeAccounts", () => {
       },
     })
 
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
@@ -399,17 +415,12 @@ describe("readAllClaudeAccounts", () => {
         },
       ])
     } finally {
-      if (originalHome === undefined) {
-        delete process.env.HOME
-      } else {
-        process.env.HOME = originalHome
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
 
   it("keeps keychain source visible when email lookup fails", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     const primaryDir = join(tempHome, ".claude")
     const workDir = join(tempHome, ".work")
@@ -420,7 +431,7 @@ describe("readAllClaudeAccounts", () => {
     writeFileSync(join(primaryDir, ".claude.json"), JSON.stringify({}))
     writeFileSync(join(workDir, ".claude.json"), JSON.stringify({}))
 
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
@@ -444,23 +455,18 @@ describe("readAllClaudeAccounts", () => {
       )
       assert.equal(account.configDir, workDir)
     } finally {
-      if (originalHome === undefined) {
-        delete process.env.HOME
-      } else {
-        process.env.HOME = originalHome
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
 
   it("keeps legacy hex suffixes that are not exactly 8 chars discoverable", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     const primaryDir = join(tempHome, ".claude")
     mkdirSync(primaryDir, { recursive: true })
     writeFileSync(join(primaryDir, ".claude.json"), JSON.stringify({}))
 
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
@@ -485,11 +491,7 @@ describe("readAllClaudeAccounts", () => {
       // existed.
       assert.equal(accounts[0].configDir, primaryDir)
     } finally {
-      if (originalHome === undefined) {
-        delete process.env.HOME
-      } else {
-        process.env.HOME = originalHome
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
@@ -653,9 +655,8 @@ describe("writeBackCredentials (file source)", () => {
   })
 
   it("reads, updates, and writes back credentials to file", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-wb-"))
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const claudeDir = join(tempHome, ".claude")
@@ -685,19 +686,14 @@ describe("writeBackCredentials (file source)", () => {
       assert.equal(written.claudeAiOauth.accessToken, "new-at")
       assert.equal(written.claudeAiOauth.subscriptionType, "pro")
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
 
   it("writes when the stored token still matches the expected one", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-cas-"))
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const claudeDir = join(tempHome, ".claude")
@@ -732,19 +728,14 @@ describe("writeBackCredentials (file source)", () => {
       assert.equal(written.claudeAiOauth.accessToken, "new-at")
       assert.equal(written.claudeAiOauth.subscriptionType, "pro")
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
 
   it("skips the write when the stored token is no longer the expected one", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-cas-"))
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const claudeDir = join(tempHome, ".claude")
@@ -782,11 +773,7 @@ describe("writeBackCredentials (file source)", () => {
         "the switched-in credential must survive untouched",
       )
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
@@ -794,11 +781,10 @@ describe("writeBackCredentials (file source)", () => {
   it("writes file with 0o600 permissions", async () => {
     if (process.platform === "win32") return
 
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-wb-perms-"),
     )
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const claudeDir = join(tempHome, ".claude")
@@ -820,21 +806,16 @@ describe("writeBackCredentials (file source)", () => {
       const mode = statSync(credPath).mode & 0o777
       assert.equal(mode, 0o600)
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
 
   it("returns false when credentials file does not exist", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-wb-missing-"),
     )
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const result = writeBackCredentials("file", {
@@ -844,21 +825,16 @@ describe("writeBackCredentials (file source)", () => {
       })
       assert.equal(result, false)
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
 
   it("returns false when credentials file contains invalid JSON", async () => {
-    const originalHome = process.env.HOME
     const tempHome = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-wb-invalid-"),
     )
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
 
     try {
       const claudeDir = join(tempHome, ".claude")
@@ -872,17 +848,12 @@ describe("writeBackCredentials (file source)", () => {
       })
       assert.equal(result, false)
     } finally {
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      restoreHome()
       rmSync(tempHome, { recursive: true, force: true })
     }
   })
 
   it("uses CLAUDE_CONFIG_DIR when set", async () => {
-    const originalHome = process.env.HOME
     const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
     const tempHome = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-wb-home-"),
@@ -890,7 +861,7 @@ describe("writeBackCredentials (file source)", () => {
     const configDir = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-wb-cfg-"),
     )
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
     process.env.CLAUDE_CONFIG_DIR = configDir
 
     try {
@@ -918,8 +889,7 @@ describe("writeBackCredentials (file source)", () => {
       const written = JSON.parse(readFileSync(credPath, "utf-8"))
       assert.equal(written.claudeAiOauth.accessToken, "new-at")
     } finally {
-      if (typeof originalHome === "string") process.env.HOME = originalHome
-      else delete process.env.HOME
+      restoreHome()
       if (typeof originalConfigDir === "string")
         process.env.CLAUDE_CONFIG_DIR = originalConfigDir
       else delete process.env.CLAUDE_CONFIG_DIR
@@ -1020,7 +990,6 @@ describe("readAllClaudeAccounts (file source)", () => {
     // keychain is tried first, so this only asserts deterministically off-mac.
     if (process.platform === "darwin") return
 
-    const originalHome = process.env.HOME
     const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
     const tempHome = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-rd-home-"),
@@ -1028,7 +997,7 @@ describe("readAllClaudeAccounts (file source)", () => {
     const configDir = await mkdtemp(
       join(tmpdir(), "opencode-claude-auth-rd-cfg-"),
     )
-    process.env.HOME = tempHome
+    const restoreHome = setHome(tempHome)
     process.env.CLAUDE_CONFIG_DIR = configDir
 
     try {
@@ -1050,8 +1019,7 @@ describe("readAllClaudeAccounts (file source)", () => {
       assert.equal(accounts[0].source, "file")
       assert.equal(accounts[0].credentials.accessToken, "cfg-at")
     } finally {
-      if (typeof originalHome === "string") process.env.HOME = originalHome
-      else delete process.env.HOME
+      restoreHome()
       if (typeof originalConfigDir === "string")
         process.env.CLAUDE_CONFIG_DIR = originalConfigDir
       else delete process.env.CLAUDE_CONFIG_DIR
@@ -1083,7 +1051,6 @@ describe("CLAUDE_CONFIG_DIR support", () => {
   })
 
   it("uses ~/.claude by default when CLAUDE_CONFIG_DIR is unset", async () => {
-    const originalHome = process.env.HOME
     delete process.env.CLAUDE_CONFIG_DIR
     const fakeHome = await mkdtemp(join(tmpdir(), "claude-home-"))
     const defaultDir = join(fakeHome, ".claude")
@@ -1093,18 +1060,14 @@ describe("CLAUDE_CONFIG_DIR support", () => {
       makeCreds("default-token"),
     )
 
-    process.env.HOME = fakeHome
+    const restoreHome = setHome(fakeHome)
 
     try {
       const creds = readCredentialsFile()
       assert.ok(creds)
       assert.equal(creds.accessToken, "default-token")
     } finally {
-      if (originalHome === undefined) {
-        delete process.env.HOME
-      } else {
-        process.env.HOME = originalHome
-      }
+      restoreHome()
       rmSync(fakeHome, { recursive: true, force: true })
     }
   })
