@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — session credentials (fork)
+
+- Pin an Anthropic managed credential per session using metadata `opencode-claude-auth/credentialID`; inherit the nearest parent pin through at most ten parent links. Unpinned roots retain global-active behavior.
+- Resolve inactive pinned credentials without global activation. Missing/legacy/non-Claude targets and malformed inheritance fail closed with token/label-free errors. Apply the same rule to primary, compaction, title and generate requests.
+- Cache session pin/parent metadata for five seconds with bounded size and metadata/deletion-event invalidation; protect pending reads against stale cache publication.
+- Register RPC `griffinmartin.claude-auth.capabilities` for dashboard feature detection.
+- Add isolated TDD/regression coverage and OpenCode 2.2.5 loopback-only server measurements. Confirm `session.update` replaces metadata, so callers must preserve other keys explicitly.
+
 ## Unreleased — managed credentials (fork)
 
 ### Features

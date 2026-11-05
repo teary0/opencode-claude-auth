@@ -116,6 +116,38 @@ The marker is inside the OpenCode OAuth credential's `metadata`; `source`, `conf
 - To roll back, stop using managed connections, restore the previous plugin version/configuration, and explicitly re-authenticate/re-import using that version. Do not merely rewrite v2 metadata to v1: the original shared refresh token may already be stale. This branch does not replace any installed plugin or change an OpenCode service.
 - Source files are unchanged by managed import/request/refresh. There is no automatic merge of OpenCode's rotated tokens back into Claude's store.
 
+## Per-session Claude credentials (this fork)
+
+Set the session metadata entry `opencode-claude-auth/credentialID` to an Anthropic **managed** credential ID to pin that session. The plugin resolves that connection directly, including refresh when inactive, without activating it globally. Other sessions can use other credentials concurrently. Primary, compaction, title and generate HTTP requests use the same selection rule.
+
+```json
+{
+  "opencode-claude-auth/credentialID": "your-managed-anthropic-credential-id"
+}
+```
+
+- Missing or `null` means no local pin. A child inherits the closest pin through at most **10 parent links**; a root without a pin follows the global active connection as before. `null` on a child does not opt out of an ancestor's pin.
+- Missing credentials, legacy v1 credentials, non-Claude methods/API keys, invalid pins, missing sessions, cycles and over-depth inheritance fail closed. They never silently use the global account. Error messages do not include credential IDs, tokens or labels.
+- Only session pin/parent metadata is cached (5 seconds, bounded to 1024 sessions), never resolved credentials or tokens. `session.metadata.updated` and `session.deleted` invalidate the cache including descendants. Updates arriving during a pending lookup cannot repopulate stale cache entries.
+- Pin changes affect subsequent request selections; a request already prepared keeps its own token and response context. The existing managed refresh/source-isolation rules still apply. This does not change the host's global provider/model availability rules.
+
+### Dashboard capability and metadata updates
+
+RPC ID **`griffinmartin.claude-auth`**, method **`capabilities`**, input `{}` returns:
+
+```json
+{
+  "sessionCredential": true,
+  "metadataKey": "opencode-claude-auth/credentialID"
+}
+```
+
+The REST call is `POST /api/rpc/griffinmartin.claude-auth/capabilities` with `{ "input": {} }` and a location query when required. OpenCode 2.2.5 wraps the result in `{ "output": ... }`. Dashboards should hide session-account controls when the RPC is unavailable.
+
+**Measured on OpenCode 2.2.5:** `session.update({ metadata })` **replaces the entire metadata object**. Read the current metadata, change only the credential-ID entry (or set it to `null`), and submit the complete object. A read-modify-write preserves unrelated keys, but concurrent metadata writers still require coordination; this plugin does not write session metadata or provide CAS.
+
+Offline tests: `node scripts/test-isolated.mjs`. The isolated server measurement used only this worktree's `dist`, fake accounts, loopback HTTP/TLS mocks and ports 14352/14353. It did not replace the operational plugin. See `specs/2026-11-05-session-credentials-design.md` for implementation boundaries and verification details.
+
 ## Migrating from OpenCode 1
 
 OpenCode 2 replaced the plugin and auth APIs this plugin used under OpenCode 1, so 3.0.0 and later only load on OpenCode 2.
