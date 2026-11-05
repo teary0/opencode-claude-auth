@@ -2,6 +2,11 @@ import { Plugin, Provider } from "@opencode/plugin"
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/promise/integration"
 import type { SessionRequest } from "@opencode/plugin/promise/session"
 import {
+  ClaudeAuthError,
+  createAuthStatus,
+  type AuthStatus,
+} from "./auth-errors.ts"
+import {
   initAccounts,
   loadPersistedAccountSource,
   setActiveAccountSource,
@@ -31,6 +36,7 @@ import {
 } from "./session-credentials.ts"
 
 export * from "./betas.ts"
+export * from "./auth-errors.ts"
 export * from "./credentials.ts"
 export * from "./oauth-method.ts"
 export * from "./provider.ts"
@@ -63,12 +69,26 @@ export function injectClaudeIdentity(event: SessionRequest): void {
   event.system.unshift({ type: "text", text: SYSTEM_IDENTITY })
 }
 
-function oauth(accounts: ReturnType<typeof readAllClaudeAccounts>) {
+function oauth(
+  accounts: ReturnType<typeof readAllClaudeAccounts>,
+  status: AuthStatus,
+) {
   return {
     integrationID: INTEGRATION_ID,
     method: oauthMethodDescriptor(accounts),
     authorize: async (inputs) => {
-      const value = await authorizeOAuth(inputs, accounts, realOAuthDeps)
+      let value
+      try {
+        value = await authorizeOAuth(inputs, accounts, realOAuthDeps)
+        status.success("import")
+      } catch (cause) {
+        const error =
+          cause instanceof ClaudeAuthError
+            ? cause
+            : new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_UNREADABLE")
+        status.failure("import", error)
+        throw error
+      }
       return {
         mode: "auto" as const,
         url: "",
@@ -85,6 +105,7 @@ export const ClaudeAuthPlugin = Plugin.define({
   id: "griffinmartin.claude-auth",
   setup: async (ctx) => {
     initLogger()
+    const authStatus = createAuthStatus()
     let accounts: ReturnType<typeof readAllClaudeAccounts> = []
     try {
       accounts = readAllClaudeAccounts()
@@ -99,7 +120,7 @@ export const ClaudeAuthPlugin = Plugin.define({
       draft.update(INTEGRATION_ID, (integration) => {
         integration.name = "Anthropic"
       })
-      draft.method.update(oauth(accounts))
+      draft.method.update(oauth(accounts, authStatus))
     })
 
     const sessionCredentials = createSessionCredentialSelector(
@@ -112,9 +133,19 @@ export const ClaudeAuthPlugin = Plugin.define({
           ctx.integration.connection.resolve(connection),
       },
       () => Date.now(),
+      authStatus,
     )
     await ctx.rpc.register(SESSION_CREDENTIAL_RPC, {
       capabilities: async () => ({ ...SESSION_CREDENTIAL_CAPABILITIES }),
+      authStatus: async (input) => {
+        // Defense in depth for direct callers; never echo invalid input.
+        if (!input || typeof input !== "object") return { state: "unknown" }
+        const { scope, sessionID } = input as Record<string, unknown>
+        if (scope === "import") return authStatus.get("import")
+        if (scope === "session" && typeof sessionID === "string" && sessionID)
+          return authStatus.get("session", sessionID)
+        return { state: "unknown" }
+      },
     })
 
     // The Anthropic integration keeps its built-in API-key method alongside

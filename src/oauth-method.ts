@@ -17,11 +17,13 @@ import {
 } from "./credentials.ts"
 import {
   refreshAccount,
+  readImportCredentials,
   writeBackCredentials,
   type ClaudeAccount,
   type ClaudeCredentials,
 } from "./keychain.ts"
 import { log } from "./logger.ts"
+import { ClaudeAuthError } from "./auth-errors.ts"
 import {
   CLAUDE_CODE_OAUTH_METADATA_KEY,
   MANAGED_CLAUDE_CODE_OAUTH_METADATA_VALUE,
@@ -52,6 +54,11 @@ export interface OAuthDeps {
   reloadCredentialsFromSource: () => ClaudeCredentials | null
   /** Raw read of the account's store, without the usable-expiry check. */
   readStoredCredentials: (
+    source: string,
+    configDir: string | undefined,
+  ) => ClaudeCredentials | null
+  /** Import diagnostics do not alter legacy refresh/store parsing. */
+  readImportCredentials?: (
     source: string,
     configDir: string | undefined,
   ) => ClaudeCredentials | null
@@ -184,7 +191,8 @@ export async function buildOAuthCredential(
       !explicitConfigDir.trim() ||
       !isAbsolute(explicitConfigDir))
   )
-    throw new Error(
+    throw new ClaudeAuthError(
+      "CLAUDE_IMPORT_INPUT_INVALID",
       "Choose the file source with an absolute Claude config directory.",
     )
   const known = deps.getAccountBySource(source)
@@ -194,16 +202,17 @@ export async function buildOAuthCredential(
       : known?.configDir
   let value: ClaudeCredentials | null
   try {
-    value = deps.readStoredCredentials(source, configDir)
-  } catch {
-    throw new Error(
-      "Selected Claude credential source is unreadable. Re-import with /connect.",
+    value = (deps.readImportCredentials ?? deps.readStoredCredentials)(
+      source,
+      configDir,
     )
+  } catch (error) {
+    if (error instanceof ClaudeAuthError) throw error
+    throw new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_UNREADABLE")
   }
-  if (!value)
-    throw new Error(
-      "Selected Claude credential source is unavailable. Re-import with /connect.",
-    )
+  if (!value) throw new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_UNAVAILABLE")
+  if (!value.accessToken?.trim() || !value.refreshToken?.trim())
+    throw new ClaudeAuthError("CLAUDE_IMPORT_TOKEN_MISSING")
   return Credential.OAuth.make({
     type: "oauth",
     methodID: METHOD_ID,
@@ -234,7 +243,10 @@ export async function authorizeOAuth(
 ): Promise<Credential.OAuth> {
   const source = resolveAuthorizeSource(inputs, fallbackAccounts, deps)
   if (!source)
-    throw new Error("Select a Claude credential source explicitly in /connect.")
+    throw new ClaudeAuthError(
+      "CLAUDE_IMPORT_INPUT_INVALID",
+      "Select a Claude credential source explicitly in /connect.",
+    )
   // Conditional form fields may leave old answers behind after a user changes
   // their selection. Never let those answers redirect a non-file/default import.
   if (source !== "file" || inputs.configLocation === "default")
@@ -243,15 +255,24 @@ export async function authorizeOAuth(
     const directory =
       typeof inputs.configDir === "string" ? inputs.configDir.trim() : ""
     if (!directory || !isAbsolute(directory))
-      throw new Error("Enter an absolute path to the Claude Code folder.")
+      throw new ClaudeAuthError(
+        "CLAUDE_IMPORT_INPUT_INVALID",
+        "Enter an absolute path to the Claude Code folder.",
+      )
     return buildOAuthCredential(source, deps, directory)
   }
   if (inputs.configLocation !== undefined)
-    throw new Error("Choose a Claude Code credentials location in /connect.")
+    throw new ClaudeAuthError(
+      "CLAUDE_IMPORT_INPUT_INVALID",
+      "Choose a Claude Code credentials location in /connect.",
+    )
   // Older clients send only configDir: retain their explicit-path / blank-default
   // behavior, without weakening validation for the new custom-location mode.
   if (inputs.configDir !== undefined && typeof inputs.configDir !== "string")
-    throw new Error("Claude config directory must be a string.")
+    throw new ClaudeAuthError(
+      "CLAUDE_IMPORT_INPUT_INVALID",
+      "Claude config directory must be a string.",
+    )
   return buildOAuthCredential(
     source,
     deps,
@@ -414,6 +435,7 @@ export const realOAuthDeps: OAuthDeps = {
   saveAccountSource,
   reloadCredentialsFromSource,
   readStoredCredentials: refreshAccount,
+  readImportCredentials,
   getAccountBySource,
   rotateAccountCredentials,
   refreshViaOAuth,

@@ -8,7 +8,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs"
-import { mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { copyFile, mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -74,6 +74,10 @@ async function loadKeychainWithMockedSecurity(
   const tempKeychain = join(tempDir, "keychain.ts")
   const tempLogger = join(tempDir, "logger.ts")
   const tempChildProcess = join(tempDir, "child-process.ts")
+  await copyFile(
+    new URL("./auth-errors.ts", import.meta.url),
+    join(tempDir, "auth-errors.ts"),
+  )
   const sourceKeychain = await readFile(
     new URL("./keychain.ts", import.meta.url),
     "utf8",

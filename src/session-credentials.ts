@@ -1,29 +1,44 @@
 import type { Credential } from "@opencode/plugin"
 import type { ConnectionInfo } from "@opencode/client"
 import { isManagedClaudeCredential, METHOD_ID } from "./oauth-method.ts"
+import {
+  AUTH_STATUS_RPC_METHOD,
+  ClaudeAuthError,
+  type AuthStatus,
+} from "./auth-errors.ts"
 
 export const SESSION_CREDENTIAL_METADATA_KEY =
   "opencode-claude-auth/credentialID"
 export const SESSION_CREDENTIAL_CAPABILITIES = {
   sessionCredential: true,
   metadataKey: SESSION_CREDENTIAL_METADATA_KEY,
+  authStatus: true,
+  authErrorCodesVersion: 1,
 } as const
 
 export const SESSION_CREDENTIAL_RPC = {
   id: "griffinmartin.claude-auth",
   methods: {
+    authStatus: AUTH_STATUS_RPC_METHOD,
     capabilities: {
       input: { type: "object", properties: {}, additionalProperties: false },
       output: {
         type: "object",
         properties: {
           sessionCredential: { type: "boolean", const: true },
+          authStatus: { type: "boolean", const: true },
+          authErrorCodesVersion: { type: "integer", const: 1 },
           metadataKey: {
             type: "string",
             const: SESSION_CREDENTIAL_METADATA_KEY,
           },
         },
-        required: ["sessionCredential", "metadataKey"],
+        required: [
+          "sessionCredential",
+          "metadataKey",
+          "authStatus",
+          "authErrorCodesVersion",
+        ],
         additionalProperties: false,
       },
     },
@@ -46,15 +61,13 @@ export interface SessionCredentialDeps {
 const CACHE_TTL_MS = 5_000
 const CACHE_LIMIT = 1024
 const MAX_PARENT_LINKS = 10
-const failure = () =>
-  new Error(
-    "Claude session credential is unavailable or invalid. Select a managed Claude credential or clear the session pin.",
-  )
+const failure = () => new ClaudeAuthError("CLAUDE_SESSION_METADATA_FAILED")
 
 /** Cache provenance only, never a token, resolved credential or global selection. */
 export function createSessionCredentialSelector(
   deps: SessionCredentialDeps,
   now = Date.now,
+  status?: AuthStatus,
 ) {
   const cache = new Map<
     string,
@@ -71,6 +84,7 @@ export function createSessionCredentialSelector(
     // A parent's metadata affects all descendants, including cached unpinned ones.
     cache.clear()
     pending.clear()
+    status?.invalidateSessions()
   }
   const read = async (sessionID: string) => {
     const cached = cache.get(sessionID)
@@ -129,7 +143,9 @@ export function createSessionCredentialSelector(
       throw failure()
     } catch {
       // Session errors and malicious metadata must never echo tokens or labels.
-      throw failure()
+      const error = failure()
+      status?.failure("session", error, sessionID)
+      throw error
     }
   }
 
@@ -137,27 +153,37 @@ export function createSessionCredentialSelector(
     sessionID: string,
   ): Promise<Credential.OAuth | undefined> => {
     const id = await credentialID(sessionID)
-    if (id === undefined) return undefined
+    if (id === undefined) {
+      // This observes only the pin path, not the global credential's health.
+      status?.success("session", sessionID)
+      return undefined
+    }
     try {
       const connection = (await deps.getConnections()).find(
         (item) => item.type === "credential" && item.id === id,
       )
-      if (
-        !connection ||
-        connection.type !== "credential" ||
-        connection.method !== "oauth"
-      )
-        throw failure()
+      if (!connection)
+        throw new ClaudeAuthError("CLAUDE_SESSION_ACCOUNT_NOT_FOUND")
+      if (connection.type !== "credential" || connection.method !== "oauth")
+        throw new ClaudeAuthError("CLAUDE_SESSION_ACCOUNT_NOT_MANAGED")
       const value = await deps.resolveConnection(connection)
+      if (!value) throw new ClaudeAuthError("CLAUDE_SESSION_RESOLVE_FAILED")
       if (
         value?.type !== "oauth" ||
         value.methodID !== METHOD_ID ||
         !isManagedClaudeCredential(value)
       )
-        throw failure()
+        throw new ClaudeAuthError("CLAUDE_SESSION_ACCOUNT_NOT_MANAGED")
+      status?.success("session", sessionID)
       return value
-    } catch {
-      throw failure()
+    } catch (cause) {
+      const error =
+        cause instanceof ClaudeAuthError &&
+        cause.code.startsWith("CLAUDE_SESSION_")
+          ? cause
+          : new ClaudeAuthError("CLAUDE_SESSION_RESOLVE_FAILED")
+      status?.failure("session", error, sessionID)
+      throw error
     }
   }
   return { credentialID, select, invalidate }

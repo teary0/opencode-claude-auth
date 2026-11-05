@@ -1,5 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
+import { mkdirSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import plugin from "./index.ts"
 import { CLAUDE_CODE_OAUTH_METADATA_KEY, METHOD_ID } from "./oauth-method.ts"
 
@@ -34,6 +36,7 @@ async function harness() {
     resolved: string[] = [],
     rpc: any[] = []
   let refresh: ((value: any) => Promise<any>) | undefined
+  let authorize: ((value: any) => Promise<any>) | undefined
   let pending: ((value: any) => void) | undefined
   const queue: any[] = []
   const ctx = {
@@ -50,6 +53,7 @@ async function harness() {
           method: {
             update: (registration: any) => {
               refresh = registration.refresh
+              authorize = registration.authorize
             },
           },
         }),
@@ -133,6 +137,7 @@ async function harness() {
     resolved,
     rpc,
     ctx,
+    authorize: (input: any) => authorize!(input),
     event,
     activeCalls: () => activeCalls,
     setActive: (id?: string) => {
@@ -166,7 +171,121 @@ describe("session credential pinning", () => {
       assert.deepEqual(await entry.handlers.capabilities({}), {
         sessionCredential: true,
         metadataKey: KEY,
+        authStatus: true,
+        authErrorCodesVersion: 1,
       })
+    } finally {
+      await h.dispose()
+    }
+  })
+
+  it("publishes safe passive import/session observations via RPC, never resolving on lookup", async () => {
+    const h = await harness()
+    try {
+      const rpc = h.rpc[0].handlers
+      const status = (sessionID = "X") =>
+        rpc.authStatus({ scope: "session", sessionID })
+      assert.deepEqual(await status(), { state: "unknown" })
+      assert.deepEqual(h.resolved, [])
+      for (const [value, code] of [
+        [undefined, "CLAUDE_SESSION_ACCOUNT_NOT_FOUND"],
+        [
+          { ...managed("A"), metadata: {} },
+          "CLAUDE_SESSION_ACCOUNT_NOT_MANAGED",
+        ],
+        [
+          { ...managed("A"), methodID: "wrong" },
+          "CLAUDE_SESSION_ACCOUNT_NOT_MANAGED",
+        ],
+      ] as const) {
+        if (value) h.values.set("A", value)
+        else h.values.delete("A")
+        await assert.rejects(h.request(), (error: any) => error.code === code)
+        assert.deepEqual(await status(), { state: "error", code })
+      }
+      h.values.set("A", managed("A"))
+      const resolve = h.ctx.integration.connection.resolve
+      h.ctx.integration.connection.resolve = async () => {
+        throw new Error("sentinel-secret-cause")
+      }
+      await assert.rejects(
+        h.request(),
+        (error: any) => error.code === "CLAUDE_SESSION_RESOLVE_FAILED",
+      )
+      assert.deepEqual(await status(), {
+        state: "error",
+        code: "CLAUDE_SESSION_RESOLVE_FAILED",
+      })
+      h.ctx.integration.connection.resolve = async () => undefined
+      await assert.rejects(
+        h.request(),
+        (error: any) => error.code === "CLAUDE_SESSION_RESOLVE_FAILED",
+      )
+      h.ctx.integration.connection.resolve = resolve
+      const count = h.resolved.length
+      await status()
+      assert.equal(h.resolved.length, count)
+      await h.request()
+      assert.deepEqual(await status(), { state: "ok" })
+      assert.deepEqual(await status("Y"), { state: "unknown" })
+      await assert.rejects(
+        h.request("missing"),
+        (error: any) => error.code === "CLAUDE_SESSION_METADATA_FAILED",
+      )
+      assert.deepEqual(await status("missing"), {
+        state: "error",
+        code: "CLAUDE_SESSION_METADATA_FAILED",
+      })
+      await assert.rejects(
+        h.authorize({ account: "file" }),
+        (error: any) => error.code === "CLAUDE_IMPORT_SOURCE_UNAVAILABLE",
+      )
+      assert.deepEqual(await rpc.authStatus({ scope: "import" }), {
+        state: "error",
+        code: "CLAUDE_IMPORT_SOURCE_UNAVAILABLE",
+      })
+      const configDir = join(
+        process.env.OPENCODE_CLAUDE_AUTH_TEST_SANDBOX!,
+        "rpc-import",
+      )
+      mkdirSync(configDir)
+      writeFileSync(
+        join(configDir, ".credentials.json"),
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: "",
+            refreshToken: "sentinel-refresh",
+            expiresAt: 1,
+          },
+        }),
+      )
+      const inputs = { account: "file", configLocation: "custom", configDir }
+      await assert.rejects(
+        h.authorize(inputs),
+        (error: any) => error.code === "CLAUDE_IMPORT_TOKEN_MISSING",
+      )
+      assert.deepEqual(await rpc.authStatus({ scope: "import" }), {
+        state: "error",
+        code: "CLAUDE_IMPORT_TOKEN_MISSING",
+      })
+      writeFileSync(
+        join(configDir, ".credentials.json"),
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: "sentinel-access",
+            refreshToken: "sentinel-refresh",
+            expiresAt: 1,
+          },
+        }),
+      )
+      await h.authorize(inputs)
+      assert.deepEqual(await rpc.authStatus({ scope: "import" }), {
+        state: "ok",
+      })
+      assert.deepEqual(await rpc.authStatus({ scope: "session" }), {
+        state: "unknown",
+      })
+      assert.equal(h.activeCalls(), 0)
     } finally {
       await h.dispose()
     }
@@ -411,6 +530,42 @@ describe("session credential pinning", () => {
       )
       assert.deepEqual(tokens, ["sentinel-refresh-A"])
       assert.equal(h.values.get("B").access, "sentinel-access-B")
+      assert.equal(h.activeCalls(), 0)
+    } finally {
+      globalThis.fetch = original
+      await h.dispose()
+    }
+  })
+
+  it("records actual managed refresh rejection without exposing the endpoint body", async () => {
+    const h = await harness(),
+      original = globalThis.fetch
+    h.values.set("A", { ...managed("A"), expires: 0 })
+    let exchanges = 0
+    globalThis.fetch = async () => {
+      exchanges++
+      return new Response("sentinel-refresh sentinel-access /sentinel/path", {
+        status: 400,
+      })
+    }
+    try {
+      await assert.rejects(h.request(), (error: any) => {
+        assert.equal(error.code, "CLAUDE_SESSION_RESOLVE_FAILED")
+        assert.doesNotMatch(JSON.stringify(error) + String(error), /sentinel/)
+        assert.equal(error.cause, undefined)
+        return true
+      })
+      assert.deepEqual(
+        await h.rpc[0].handlers.authStatus({
+          scope: "session",
+          sessionID: "X",
+        }),
+        {
+          state: "error",
+          code: "CLAUDE_SESSION_RESOLVE_FAILED",
+        },
+      )
+      assert.equal(exchanges, 1)
       assert.equal(h.activeCalls(), 0)
     } finally {
       globalThis.fetch = original

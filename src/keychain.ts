@@ -10,6 +10,7 @@ import {
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { log } from "./logger.ts"
+import { ClaudeAuthError } from "./auth-errors.ts"
 
 export interface ClaudeCredentials {
   accessToken: string
@@ -585,4 +586,57 @@ export function refreshAccount(
   const raw = readKeychainService(source)
   if (!raw) return null
   return parseCredentials(raw)
+}
+
+/** Import-only strict read. Legacy parsing and refresh/write-back stay unchanged. */
+export function readImportCredentials(
+  source: string,
+  configDir?: string,
+): ClaudeCredentials {
+  let raw: string | null
+  try {
+    raw =
+      source === "file"
+        ? readFileSync(
+            join(
+              configDir ??
+                process.env.CLAUDE_CONFIG_DIR ??
+                join(homedir(), ".claude"),
+              ".credentials.json",
+            ),
+            "utf-8",
+          )
+        : readKeychainService(source)
+  } catch (error) {
+    throw new ClaudeAuthError(
+      source === "file" && (error as NodeJS.ErrnoException)?.code === "ENOENT"
+        ? "CLAUDE_IMPORT_SOURCE_UNAVAILABLE"
+        : "CLAUDE_IMPORT_SOURCE_UNREADABLE",
+    )
+  }
+  if (raw === null)
+    throw new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_UNAVAILABLE")
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_INVALID")
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_INVALID")
+  const data = (parsed as Record<string, unknown>).claudeAiOauth ?? parsed
+  if (!data || typeof data !== "object" || Array.isArray(data))
+    throw new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_INVALID")
+  const credentials = data as Record<string, unknown>
+  if (
+    typeof credentials.accessToken !== "string" ||
+    !credentials.accessToken.trim() ||
+    typeof credentials.refreshToken !== "string" ||
+    !credentials.refreshToken.trim()
+  )
+    throw new ClaudeAuthError("CLAUDE_IMPORT_TOKEN_MISSING")
+  const value = parseCredentials(raw)
+  if (!value || !Number.isFinite(value.expiresAt))
+    throw new ClaudeAuthError("CLAUDE_IMPORT_SOURCE_INVALID")
+  return value
 }
