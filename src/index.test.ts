@@ -6,6 +6,7 @@ import plugin, {
 } from "./index.ts"
 import { CLAUDE_CODE_OAUTH_METADATA_KEY, METHOD_ID } from "./oauth-method.ts"
 import { SYSTEM_IDENTITY } from "./transforms.ts"
+import { initAccounts, setActiveAccountSource } from "./credentials.ts"
 
 type Request = Parameters<typeof injectClaudeIdentity>[0]
 
@@ -80,6 +81,120 @@ describe("IDENTITY_REQUEST_HOOKS", () => {
 })
 
 describe("native provider HTTP hooks", () => {
+  it("pins in-flight managed A responses and beta retries while B becomes active", async () => {
+    const hooks = new Map<string, (event: any) => Promise<void>>()
+    const marker = {
+      [CLAUDE_CODE_OAUTH_METADATA_KEY]: "v2",
+      credentialAuthority: "opencode",
+      source: "file",
+    }
+    let credential: any = {
+      type: "oauth",
+      methodID: METHOD_ID,
+      access: "managed-A",
+      refresh: "refresh-A",
+      metadata: marker,
+    }
+    let resolves = 0
+    const ctx = {
+      integration: {
+        transform: async () => {},
+        connection: {
+          active: async () => ({ type: "credential", id: "active" }),
+          resolve: async () => {
+            resolves++
+            return credential
+          },
+        },
+      },
+      provider: { transform: async () => {}, reload: async () => {} },
+      event: { subscribe: async function* () {} },
+      session: {
+        hook: async (kind: string, hook: any) => {
+          hooks.set(kind, hook)
+        },
+      },
+    }
+    const dispose = await plugin.setup(ctx as never)
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = async (_url, init) => {
+      calls.push(new Headers(init?.headers).get("authorization")!)
+      return new Response(
+        'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Read"}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      )
+    }
+    try {
+      const eventA = {
+        model: { providerID: "anthropic" },
+        request: nativeRequest(),
+      }
+      await hooks.get("http.request")!(eventA)
+      assert.equal(
+        eventA.request.headers.get("authorization"),
+        "Bearer managed-A",
+      )
+      credential = { ...credential, access: "managed-B", refresh: "refresh-B" }
+      initAccounts([
+        {
+          label: "B",
+          source: "file",
+          credentials: {
+            accessToken: "managed-B",
+            refreshToken: "refresh-B",
+            expiresAt: Date.now() + 3600000,
+          },
+        },
+      ])
+      setActiveAccountSource("file")
+      const eventB = {
+        model: { providerID: "anthropic" },
+        request: nativeRequest(),
+      }
+      await hooks.get("http.request")!(eventB)
+      assert.equal(
+        eventB.request.headers.get("authorization"),
+        "Bearer managed-B",
+      )
+      const before = resolves
+      const responseA = {
+        ...eventA,
+        response: new Response("long context beta is not yet available", {
+          status: 400,
+        }),
+      }
+      await hooks.get("http.response")!(responseA)
+      assert.equal(
+        resolves,
+        before,
+        "response must not resolve global active connection again",
+      )
+      assert.deepEqual(calls, ["Bearer managed-A"])
+      assert.match(await responseA.response.text(), /"name": "read"/)
+      const responseB = {
+        ...eventB,
+        response: new Response("denied", { status: 401 }),
+      }
+      await hooks.get("http.response")!(responseB)
+      assert.equal(responseB.response.status, 401)
+      assert.equal(calls.length, 1)
+      assert.equal(credential.access, "managed-B")
+
+      const other = {
+        model: { providerID: "openai" },
+        request: nativeRequest(),
+      }
+      const native = other.request
+      await hooks.get("http.request")!(other)
+      assert.equal(other.request, native)
+    } finally {
+      globalThis.fetch = originalFetch
+      initAccounts([])
+      await dispose?.()
+    }
+  })
+
   it("keeps native model packages and only adjusts subscription requests", async () => {
     const hooks = new Map<string, (event: any) => Promise<void>>()
     let credential: any = { type: "key", key: "sk-test" }

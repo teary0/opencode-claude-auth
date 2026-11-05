@@ -1,11 +1,15 @@
 import { Credential, Integration } from "@opencode/plugin"
 import type { IntegrationOAuthMethod } from "@opencode/plugin/promise/integration"
+import { createHash } from "node:crypto"
+import { homedir } from "node:os"
+import { isAbsolute, join } from "node:path"
 import {
   getAccountBySource,
   getCachedCredentials,
   loadPersistedAccountSource,
   refreshAccountsList,
   refreshViaOAuth,
+  refreshManagedViaOAuth,
   reloadCredentialsFromSource,
   rotateAccountCredentials,
   saveAccountSource,
@@ -18,15 +22,16 @@ import {
   type ClaudeCredentials,
 } from "./keychain.ts"
 import { log } from "./logger.ts"
+import {
+  CLAUDE_CODE_OAUTH_METADATA_KEY,
+  MANAGED_CLAUDE_CODE_OAUTH_METADATA_VALUE,
+  isManagedClaudeCredential,
+} from "./credential-metadata.ts"
+export * from "./credential-metadata.ts"
 
 export const INTEGRATION_ID: Integration.ID = Integration.ID.make("anthropic")
 export const METHOD_ID: Integration.MethodID =
   Integration.MethodID.make("claude-code")
-
-/** Identifies credentials created by this plugin when OpenCode builds provider options. */
-export const CLAUDE_CODE_OAUTH_METADATA_KEY =
-  "opencode-claude-auth/claude-code-oauth"
-export const CLAUDE_CODE_OAUTH_METADATA_VALUE = "v1"
 
 /** Form field key the account chooser collects its answer under. */
 const ACCOUNT_FIELD_KEY = "account"
@@ -56,6 +61,9 @@ export interface OAuthDeps {
     account: ClaudeAccount,
   ) => Promise<ClaudeCredentials | null>
   refreshViaOAuth: (refreshToken: string) => Promise<ClaudeCredentials | null>
+  refreshManagedViaOAuth: (
+    refreshToken: string,
+  ) => Promise<ClaudeCredentials | null>
   writeBackCredentials: (
     source: string,
     creds: ClaudeCredentials,
@@ -68,11 +76,11 @@ export interface OAuthDeps {
 /** A `Form.Answer` as the host collected it from {@link oauthMethodDescriptor}. */
 export interface AuthorizeInputs {
   readonly account?: unknown
+  readonly configDir?: unknown
 }
 
 /**
- * `/connect` shows this when the user picks the Claude Code method. With more
- * than one account on the machine it carries a chooser: OpenCode renders a
+ * `/connect` always requires an explicit source. OpenCode renders a
  * `string` field that has `options` as a pick list (no `custom`, so only a
  * listed account can be chosen) and hands the selection back to `authorize`
  * under the field's key. Each option is described by its credential source,
@@ -86,7 +94,17 @@ export function oauthMethodDescriptor(
     type: "oauth",
     label: "Import Claude Code subscription",
   } as const
-  if (accounts.length <= 1) return method
+  const options = accounts.map((account) => ({
+    value: account.source,
+    label: account.label,
+    description: account.source,
+  }))
+  if (!options.some((option) => option.value === "file"))
+    options.push({
+      value: "file",
+      label: "Credentials file",
+      description: "Default or explicit Claude config directory",
+    })
   return {
     ...method,
     form: [
@@ -95,11 +113,14 @@ export function oauthMethodDescriptor(
         key: ACCOUNT_FIELD_KEY,
         title: "Select a Claude Code account",
         required: true,
-        options: accounts.map((account) => ({
-          value: account.source,
-          label: account.label,
-          description: account.source,
-        })),
+        options,
+      },
+      {
+        type: "string",
+        key: "configDir",
+        title:
+          "Claude config directory (file source only; absolute path, blank for default)",
+        required: false,
       },
     ],
   }
@@ -107,32 +128,45 @@ export function oauthMethodDescriptor(
 
 export function resolveAuthorizeSource(
   inputs: AuthorizeInputs,
-  fallbackAccounts: readonly ClaudeAccount[],
-  deps: Pick<OAuthDeps, "refreshAccountsList" | "loadPersistedAccountSource">,
+  _fallbackAccounts: readonly ClaudeAccount[],
+  _deps: Pick<OAuthDeps, "refreshAccountsList" | "loadPersistedAccountSource">,
 ): string | undefined {
-  const latest = deps.refreshAccountsList()
   const chosen = inputs[ACCOUNT_FIELD_KEY]
-  return (
-    (typeof chosen === "string" ? chosen : undefined) ??
-    deps.loadPersistedAccountSource() ??
-    latest[0]?.source ??
-    fallbackAccounts[0]?.source
-  )
+  return typeof chosen === "string" && chosen.trim() ? chosen : undefined
 }
 
 export async function buildOAuthCredential(
   source: string,
   deps: OAuthDeps,
+  explicitConfigDir?: string,
 ): Promise<Credential.OAuth> {
-  const accounts = deps.refreshAccountsList()
-  const account = accounts.find((item) => item.source === source) ?? accounts[0]
-  if (!account)
+  if (
+    explicitConfigDir &&
+    (source !== "file" || !isAbsolute(explicitConfigDir))
+  )
     throw new Error(
-      "No Claude Code credentials found. Run `claude` to authenticate first.",
+      "Choose the file source with an absolute Claude config directory.",
     )
-  deps.setActiveAccountSource(account.source)
-  deps.saveAccountSource(account.source)
-  const value = (await deps.getCachedCredentials()) ?? account.credentials
+  const known = deps.getAccountBySource(source)
+  const configDir =
+    source === "file"
+      ? (explicitConfigDir ??
+        known?.configDir ??
+        process.env.CLAUDE_CONFIG_DIR ??
+        join(homedir(), ".claude"))
+      : known?.configDir
+  let value: ClaudeCredentials | null
+  try {
+    value = deps.readStoredCredentials(source, configDir)
+  } catch {
+    throw new Error(
+      "Selected Claude credential source is unreadable. Re-import with /connect.",
+    )
+  }
+  if (!value)
+    throw new Error(
+      "Selected Claude credential source is unavailable. Re-import with /connect.",
+    )
   return Credential.OAuth.make({
     type: "oauth",
     methodID: METHOD_ID,
@@ -140,10 +174,15 @@ export async function buildOAuthCredential(
     refresh: value.refreshToken,
     expires: value.expiresAt,
     metadata: {
-      [CLAUDE_CODE_OAUTH_METADATA_KEY]: CLAUDE_CODE_OAUTH_METADATA_VALUE,
-      source: account.source,
-      label: account.label,
-      ...(account.configDir ? { configDir: account.configDir } : {}),
+      [CLAUDE_CODE_OAUTH_METADATA_KEY]:
+        MANAGED_CLAUDE_CODE_OAUTH_METADATA_VALUE,
+      credentialAuthority: "opencode",
+      source,
+      label:
+        known && (!explicitConfigDir || known.configDir === explicitConfigDir)
+          ? known.label
+          : "Claude Code subscription",
+      ...(configDir ? { configDir } : {}),
       ...(value.subscriptionType
         ? { subscriptionType: value.subscriptionType }
         : {}),
@@ -158,10 +197,14 @@ export async function authorizeOAuth(
 ): Promise<Credential.OAuth> {
   const source = resolveAuthorizeSource(inputs, fallbackAccounts, deps)
   if (!source)
-    throw new Error(
-      "No Claude Code credentials found. Run `claude` to authenticate first.",
-    )
-  return buildOAuthCredential(source, deps)
+    throw new Error("Select a Claude credential source explicitly in /connect.")
+  if (inputs.configDir !== undefined && typeof inputs.configDir !== "string")
+    throw new Error("Claude config directory must be a string.")
+  return buildOAuthCredential(
+    source,
+    deps,
+    inputs.configDir?.trim() || undefined,
+  )
 }
 
 export interface RefreshableCredential {
@@ -171,10 +214,53 @@ export interface RefreshableCredential {
   readonly metadata?: Record<string, unknown>
 }
 
+// In-process only. A source is provenance, NOT an identity: many credentials can
+// originate from the same file. Share the exchange, never another caller's metadata.
+const managedRefreshes = new Map<string, Promise<ClaudeCredentials | null>>()
+
+async function refreshManagedCredential(
+  value: RefreshableCredential,
+  deps: OAuthDeps,
+): Promise<Credential.OAuth> {
+  const key = createHash("sha256").update(value.refresh).digest("hex")
+  let pending = managedRefreshes.get(key)
+  if (!pending) {
+    pending = Promise.resolve().then(() =>
+      deps.refreshManagedViaOAuth(value.refresh),
+    )
+    managedRefreshes.set(key, pending)
+  }
+  try {
+    const refreshed = await pending
+    if (!refreshed) throw new Error("refresh failed")
+    return Credential.OAuth.make({
+      ...value,
+      methodID: METHOD_ID,
+      access: refreshed.accessToken,
+      refresh: refreshed.refreshToken,
+      expires: refreshed.expiresAt,
+    })
+  } catch {
+    // Never expose endpoint bodies or transport exceptions, which may echo tokens.
+    throw new Error(
+      "Managed Claude OAuth refresh failed. Retry later or re-import with /connect; no other account was used.",
+    )
+  } finally {
+    if (managedRefreshes.get(key) === pending) managedRefreshes.delete(key)
+  }
+}
+
 export async function refreshOAuthCredential(
   value: RefreshableCredential,
   deps: OAuthDeps,
 ): Promise<Credential.OAuth> {
+  if (isManagedClaudeCredential(value))
+    return refreshManagedCredential(value, deps)
+  // A malformed/future managed marker must not fall into the legacy store path.
+  if (value.metadata?.[CLAUDE_CODE_OAUTH_METADATA_KEY] === "v2")
+    throw new Error(
+      "Invalid managed Claude credential metadata. Re-import with /connect.",
+    )
   const source =
     typeof value.metadata?.source === "string"
       ? value.metadata.source
@@ -279,6 +365,7 @@ export const realOAuthDeps: OAuthDeps = {
   getAccountBySource,
   rotateAccountCredentials,
   refreshViaOAuth,
+  refreshManagedViaOAuth,
   writeBackCredentials,
   log,
 }

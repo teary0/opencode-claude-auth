@@ -6,6 +6,7 @@ import {
   buildOAuthCredential,
   CLAUDE_CODE_OAUTH_METADATA_KEY,
   CLAUDE_CODE_OAUTH_METADATA_VALUE,
+  MANAGED_CLAUDE_CODE_OAUTH_METADATA_VALUE,
   labelOAuthCredential,
   oauthMethodDescriptor,
   refreshOAuthCredential,
@@ -35,7 +36,7 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
     writeBackCredentials: [],
     log: [],
   }
-  return {
+  const dependencies = {
     calls,
     refreshAccountsList: () => [account()],
     loadPersistedAccountSource: () => null,
@@ -53,6 +54,7 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
     getAccountBySource: () => null,
     rotateAccountCredentials: async () => null,
     refreshViaOAuth: async () => null,
+    refreshManagedViaOAuth: async () => null,
     writeBackCredentials: (source, creds, configDir, expected) => {
       calls.writeBackCredentials.push([source, creds, configDir, expected])
       return true
@@ -61,20 +63,30 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
       calls.log.push([event, data])
     },
     ...overrides,
-  }
+  } satisfies OAuthDeps & { calls: Record<string, unknown[]> }
+  if (!overrides.getAccountBySource)
+    dependencies.getAccountBySource = (source) =>
+      dependencies
+        .refreshAccountsList()
+        .find((item) => item.source === source) ?? null
+  if (!overrides.readStoredCredentials)
+    dependencies.readStoredCredentials = (source) =>
+      dependencies.refreshAccountsList().find((item) => item.source === source)
+        ?.credentials ?? null
+  return dependencies
 }
 
 describe("oauthMethodDescriptor", () => {
-  it("omits the chooser for a single account", () => {
+  it("requires an explicit choice even for a single account", () => {
     const descriptor = oauthMethodDescriptor([account()])
     assert.equal(descriptor.id, "claude-code")
     assert.equal(descriptor.type, "oauth")
     assert.equal(descriptor.label, "Import Claude Code subscription")
-    assert.equal(descriptor.form, undefined)
+    assert.equal(descriptor.form?.[0].required, true)
   })
 
-  it("omits the chooser for zero accounts", () => {
-    assert.equal(oauthMethodDescriptor([]).form, undefined)
+  it("offers explicit file import when discovery finds no accounts", () => {
+    assert.equal(oauthMethodDescriptor([]).form?.[0].key, "account")
   })
 
   it("offers every account through a pick-list form field", () => {
@@ -84,7 +96,7 @@ describe("oauthMethodDescriptor", () => {
     ])
     // A chooser is a `string` field carrying `options`; OpenCode has no
     // `select` field type, and a field without `options` renders as free text.
-    assert.equal(descriptor.form?.length, 1)
+    assert.equal(descriptor.form?.length, 2)
     const field = descriptor.form?.[0]
     assert.equal(field?.type, "string")
     assert.equal(field?.key, "account")
@@ -93,6 +105,11 @@ describe("oauthMethodDescriptor", () => {
     assert.deepEqual(field?.type === "string" ? field.options : undefined, [
       { value: "a", label: "Claude Pro", description: "a" },
       { value: "b", label: "Claude Max", description: "b" },
+      {
+        value: "file",
+        label: "Credentials file",
+        description: "Default or explicit Claude config directory",
+      },
     ])
     // Without `custom` the host only accepts one of the listed accounts.
     assert.equal(field?.type === "string" ? field.custom : undefined, undefined)
@@ -130,7 +147,7 @@ describe("resolveAuthorizeSource", () => {
     assert.equal(source, "explicit")
   })
 
-  it("falls back to the persisted account source", () => {
+  it("does not fall back to the persisted account source", () => {
     const deps = makeDeps({
       refreshAccountsList: () => [account({ source: "latest" })],
       loadPersistedAccountSource: () => "persisted",
@@ -140,10 +157,10 @@ describe("resolveAuthorizeSource", () => {
       [account({ source: "fallback" })],
       deps,
     )
-    assert.equal(source, "persisted")
+    assert.equal(source, undefined)
   })
 
-  it("falls back to the first freshly-listed account", () => {
+  it("does not select the first freshly-listed account", () => {
     const deps = makeDeps({
       refreshAccountsList: () => [account({ source: "latest" })],
       loadPersistedAccountSource: () => null,
@@ -153,10 +170,10 @@ describe("resolveAuthorizeSource", () => {
       [account({ source: "fallback" })],
       deps,
     )
-    assert.equal(source, "latest")
+    assert.equal(source, undefined)
   })
 
-  it("falls back to the first account from the original snapshot", () => {
+  it("does not select from the original snapshot", () => {
     const deps = makeDeps({
       refreshAccountsList: () => [],
       loadPersistedAccountSource: () => null,
@@ -166,7 +183,7 @@ describe("resolveAuthorizeSource", () => {
       [account({ source: "fallback" })],
       deps,
     )
-    assert.equal(source, "fallback")
+    assert.equal(source, undefined)
   })
 
   it("returns undefined when nothing is available", () => {
@@ -184,7 +201,7 @@ describe("resolveAuthorizeSource", () => {
       loadPersistedAccountSource: () => null,
     })
     const source = resolveAuthorizeSource({ account: 42 }, [], deps)
-    assert.equal(source, "latest")
+    assert.equal(source, undefined)
   })
 })
 
@@ -203,27 +220,29 @@ describe("buildOAuthCredential", () => {
     assert.equal(value.metadata?.label, "B")
     assert.equal(
       value.metadata?.[CLAUDE_CODE_OAUTH_METADATA_KEY],
-      CLAUDE_CODE_OAUTH_METADATA_VALUE,
+      MANAGED_CLAUDE_CODE_OAUTH_METADATA_VALUE,
     )
   })
 
-  it("falls back to the first account when the source doesn't match any", async () => {
+  it("rejects a missing selected source rather than importing the first account", async () => {
     const deps = makeDeps({
       refreshAccountsList: () => [account({ source: "only" })],
     })
-    const value = await buildOAuthCredential("missing", deps)
-    assert.equal(value.metadata?.source, "only")
+    await assert.rejects(
+      () => buildOAuthCredential("missing", deps),
+      /source is unavailable/,
+    )
   })
 
   it("throws when there are no accounts at all", async () => {
     const deps = makeDeps({ refreshAccountsList: () => [] })
     await assert.rejects(
       () => buildOAuthCredential("anything", deps),
-      /Run `claude` to authenticate first/,
+      /source is unavailable/,
     )
   })
 
-  it("prefers cached credentials over the account's stored credentials", async () => {
+  it("ignores cached credentials and imports only the selected fresh store", async () => {
     const deps = makeDeps({
       refreshAccountsList: () => [account({ source: "a" })],
       getCachedCredentials: async () => ({
@@ -233,9 +252,9 @@ describe("buildOAuthCredential", () => {
       }),
     })
     const value = await buildOAuthCredential("a", deps)
-    assert.equal(value.access, "cached-access")
-    assert.equal(value.refresh, "cached-refresh")
-    assert.equal(value.expires, 123)
+    assert.equal(value.access, "sk-ant-oat01-access")
+    assert.equal(value.refresh, "sk-ant-ort01-refresh")
+    assert.notEqual(value.expires, 123)
   })
 
   it("falls back to the account's stored credentials when nothing is cached", async () => {
@@ -305,13 +324,13 @@ describe("buildOAuthCredential", () => {
     )
   })
 
-  it("marks the resolved account as active and persists the selection", async () => {
+  it("does not mutate legacy active-account selection", async () => {
     const deps = makeDeps({
       refreshAccountsList: () => [account({ source: "chosen" })],
     })
     await buildOAuthCredential("chosen", deps)
-    assert.deepEqual(deps.calls.setActiveAccountSource, ["chosen"])
-    assert.deepEqual(deps.calls.saveAccountSource, ["chosen"])
+    assert.deepEqual(deps.calls.setActiveAccountSource, [])
+    assert.deepEqual(deps.calls.saveAccountSource, [])
   })
 })
 
@@ -321,7 +340,7 @@ describe("authorizeOAuth", () => {
       refreshAccountsList: () => [account({ source: "resolved" })],
       loadPersistedAccountSource: () => "resolved",
     })
-    const value = await authorizeOAuth({}, [], deps)
+    const value = await authorizeOAuth({ account: "resolved" }, [], deps)
     assert.equal(value.metadata?.source, "resolved")
   })
 
@@ -332,7 +351,7 @@ describe("authorizeOAuth", () => {
     })
     await assert.rejects(
       () => authorizeOAuth({}, [], deps),
-      /Run `claude` to authenticate first/,
+      /Select a Claude credential source explicitly/,
     )
   })
 })

@@ -282,6 +282,46 @@ export function extractOAuthError(raw: string): {
 
 const OAUTH_TIMEOUT_MS = 15_000
 
+/** Managed credentials never consult or update a CLI store, or retry a spent token. */
+export async function refreshManagedViaOAuth(
+  refreshToken: string,
+): Promise<ClaudeCredentials | null> {
+  if (!refreshToken) return null
+  try {
+    const response = await fetch(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": getUserAgent(),
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: OAUTH_CLIENT_ID,
+        refresh_token: refreshToken,
+      }).toString(),
+      signal: AbortSignal.timeout(OAUTH_TIMEOUT_MS),
+    })
+    if (!response.ok) {
+      log("managed_refresh_failed", { status: response.status })
+      return null
+    }
+    const creds = parseOAuthResponse(await response.text(), refreshToken)
+    if (
+      !creds ||
+      typeof creds.accessToken !== "string" ||
+      typeof creds.refreshToken !== "string" ||
+      !creds.refreshToken ||
+      !Number.isFinite(creds.expiresAt) ||
+      creds.expiresAt <= Date.now()
+    )
+      return null
+    return creds
+  } catch {
+    log("managed_refresh_failed", { reason: "transport_or_response" })
+    return null
+  }
+}
+
 /**
  * Exchanges a refresh token for fresh credentials using the runtime's own
  * fetch.

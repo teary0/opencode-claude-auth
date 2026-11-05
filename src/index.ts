@@ -10,8 +10,8 @@ import { readAllClaudeAccounts } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
 import {
   authorizeOAuth,
-  CLAUDE_CODE_OAUTH_METADATA_KEY,
-  CLAUDE_CODE_OAUTH_METADATA_VALUE,
+  isClaudeOAuthCredential,
+  isManagedClaudeCredential,
   INTEGRATION_ID,
   labelOAuthCredential,
   METHOD_ID,
@@ -19,7 +19,11 @@ import {
   realOAuthDeps,
   refreshOAuthCredential,
 } from "./oauth-method.ts"
-import { finishClaudeResponse, prepareClaudeRequest } from "./provider.ts"
+import {
+  finishClaudeResponse,
+  prepareClaudeRequest,
+  type ClaudeRequestContext,
+} from "./provider.ts"
 
 export * from "./betas.ts"
 export * from "./credentials.ts"
@@ -155,7 +159,7 @@ export const ClaudeAuthPlugin = Plugin.define({
 
     // OpenCode's native Anthropic provider owns prompt conversion and streaming.
     // These HTTP hooks apply only the Claude Code subscription wire contract.
-    const requests = new WeakMap<Request, { source?: string }>()
+    const requests = new WeakMap<Request, ClaudeRequestContext>()
     await ctx.session.hook("http.request", async (event) => {
       if (event.model.providerID !== PROVIDER_ID) return
       const connection = await ctx.integration.connection.active(INTEGRATION_ID)
@@ -164,20 +168,25 @@ export const ClaudeAuthPlugin = Plugin.define({
       if (
         credential?.type !== "oauth" ||
         credential.methodID !== METHOD_ID ||
-        credential.metadata?.[CLAUDE_CODE_OAUTH_METADATA_KEY] !==
-          CLAUDE_CODE_OAUTH_METADATA_VALUE
+        !isClaudeOAuthCredential(credential)
       )
         return
       const source =
-        typeof credential.metadata.source === "string"
+        typeof credential.metadata?.source === "string"
           ? credential.metadata.source
           : undefined
+      const context: ClaudeRequestContext = {
+        source,
+        ...(isManagedClaudeCredential(credential)
+          ? { credentialAuthority: "opencode" as const }
+          : {}),
+      }
       event.request = await prepareClaudeRequest(
         event.request,
         credential.access,
-        source,
+        context,
       )
-      requests.set(event.request, { source })
+      requests.set(event.request, context)
     })
     await ctx.session.hook("http.response", async (event) => {
       const context = requests.get(event.request)
@@ -186,7 +195,7 @@ export const ClaudeAuthPlugin = Plugin.define({
       event.response = await finishClaudeResponse(
         event.request,
         event.response,
-        context.source,
+        context,
       )
     })
 

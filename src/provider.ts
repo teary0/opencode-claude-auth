@@ -99,6 +99,16 @@ export function buildRequestHeaders(
 const resolveAccount = (source?: string): ClaudeAccount | null =>
   source === undefined ? getActiveAccount() : getAccountBySource(source)
 
+export interface ClaudeRequestContext {
+  source?: string
+  credentialAuthority?: "opencode"
+}
+function requestContext(
+  value?: string | ClaudeRequestContext,
+): ClaudeRequestContext {
+  return typeof value === "string" ? { source: value } : (value ?? {})
+}
+
 function modelFromBody(body: string): string {
   try {
     return (JSON.parse(body) as { model?: string }).model ?? "unknown"
@@ -111,14 +121,20 @@ function modelFromBody(body: string): string {
 export async function prepareClaudeRequest(
   request: Request,
   accessToken: string,
-  source?: string,
+  source?: string | ClaudeRequestContext,
 ): Promise<Request> {
   const body = await request.clone().text()
   const modelID = modelFromBody(body)
-  const account = resolveAccount(source)
+  const context = requestContext(source)
+  const account =
+    context.credentialAuthority === "opencode"
+      ? null
+      : resolveAccount(context.source)
   const credentials =
-    (await getCachedCredentials(account)) ??
-    (await getCredentialsWithBackoff({}, account))
+    context.credentialAuthority === "opencode"
+      ? null
+      : ((await getCachedCredentials(account)) ??
+        (await getCredentialsWithBackoff({}, account)))
   const token = credentials?.accessToken ?? accessToken
   if (!token)
     throw new Error(
@@ -156,11 +172,13 @@ async function sendRequest(request: Request, send: Fetch): Promise<Response> {
 export async function finishClaudeResponse(
   request: Request,
   initial: Response,
-  source?: string,
+  source?: string | ClaudeRequestContext,
   send: Fetch = fetch,
 ): Promise<Response> {
   const modelID = modelFromBody(await request.clone().text())
-  const account = resolveAccount(source)
+  const context = requestContext(source)
+  const managed = context.credentialAuthority === "opencode"
+  const account = managed ? null : resolveAccount(context.source)
   let token =
     request.headers.get("authorization")?.replace(/^Bearer /i, "") ?? ""
   const sendWithToken = (
@@ -189,7 +207,11 @@ export async function finishClaudeResponse(
 
   let response = initial
 
-  for (let attempt = 0; response.status === 401 && attempt < 2; attempt++) {
+  for (
+    let attempt = 0;
+    !managed && response.status === 401 && attempt < 2;
+    attempt++
+  ) {
     let candidate: ClaudeCredentials | null =
       reloadCredentialsFromSource(account)
     if (!candidate || candidate.accessToken === token)
@@ -200,7 +222,7 @@ export async function finishClaudeResponse(
     response = await sendWithToken(token)
   }
 
-  if (response.status === 429) {
+  if (!managed && response.status === 429) {
     const rotated = reloadCredentialsFromSource(account)
     if (rotated && rotated.accessToken !== token) {
       token = rotated.accessToken
@@ -212,6 +234,7 @@ export async function finishClaudeResponse(
   }
 
   for (let attempt = 0; attempt < LONG_CONTEXT_BETAS.length; attempt++) {
+    if (managed && response.status === 429) break
     if (response.status !== 400 && response.status !== 429) break
     if (!isLongContextError(await response.clone().text())) break
     const beta = getNextBetaToExclude(modelID)
@@ -229,7 +252,7 @@ export async function finishClaudeResponse(
 export function claudeSubscriptionFetch(
   accessToken: string,
   upstream?: Fetch,
-  source?: string,
+  source?: string | ClaudeRequestContext,
 ): Fetch {
   const send = upstream ?? fetch
   return async (input, init = {}) => {
