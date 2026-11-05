@@ -6,3 +6,7 @@ dist/
 .sisyphus/
 .opencode/
 docs/
+test-results/dependency-home/
+test-results/isolated-*/
+test-results/*.log
+test-results/dist-sha256.txt

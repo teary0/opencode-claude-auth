@@ -28,9 +28,11 @@ function setHome(dir: string): () => void {
   const saved = {
     HOME: process.env.HOME,
     USERPROFILE: process.env.USERPROFILE,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
   }
   process.env.HOME = dir
   process.env.USERPROFILE = dir
+  process.env.CLAUDE_CONFIG_DIR = join(dir, ".claude")
   return () => {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]
