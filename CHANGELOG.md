@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — managed credentials (fork)
+
+### Features
+
+- New imports are v2 OAuth credentials with `credentialAuthority: "opencode"`; export `isManagedClaudeCredential` for host/dashboard checks. Existing v1 credentials remain legacy until explicitly re-imported.
+- Pin managed requests and in-flight response retries to the resolved credential. Managed refresh exchanges only its refresh token, preserves metadata, and single-flights concurrent exchanges per token in-process.
+- Managed paths never adopt source replacements, borrow other accounts, run CLI fallback, or write source credentials. 401/429/refresh failures stay with the originating credential.
+- Require explicit import source selection and support absolute per-account file config directories through the OpenCode form SDK. Missing selections fail instead of using the first/cached account.
+
+### Tests and tooling
+
+- Cross-platform isolated runner redirects HOME, USERPROFILE, CLAUDE_CONFIG_DIR, APPDATA, LOCALAPPDATA, XDG and temp/lock directories per worker; unfaked network and subprocess calls are blocked.
+- Windows-compatible Node build replaces Unix-only rm/cp commands. Add managed isolation, switching, refresh concurrency, sentinel-redaction and legacy/transport regression coverage.
+
+### Caveats
+
+- Imported CLI/OpenCode copies may share a rotating refresh token. No cross-process managed refresh coordination or automatic re-import is provided; see README migration/rollback guidance.
+
 ## [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.1...v3.0.0) (2026-10-16)
 
 

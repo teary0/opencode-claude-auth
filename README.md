@@ -19,7 +19,7 @@ Self-contained Anthropic auth provider for OpenCode 2 using your Claude Code sub
 
 The plugin registers a Claude Code subscription auth method on OpenCode's built-in Anthropic provider. Run `/connect`, choose **Anthropic**, then **Import Claude Code subscription** — it reads OAuth tokens directly from the macOS Keychain (or `~/.claude/.credentials.json` — or `$CLAUDE_CONFIG_DIR/.credentials.json` if that env var is set — on other platforms) and hands them to OpenCode.
 
-OpenCode's native Anthropic provider handles prompt conversion and streaming. Session hooks add the Claude Code identity and adjust subscription requests to set `Authorization: Bearer` with the current access token (and strip `x-api-key`), translate tool names, and process responses. OpenCode owns the credential's lifecycle from there and calls back into the plugin to refresh it as needed. Refreshes go directly to Anthropic's OAuth endpoint (zero LLM tokens consumed); the plugin always checks the keychain first and adopts whatever is there if it differs from what OpenCode handed back, so an independent `claude` re-login or refresh doesn't leave OpenCode stuck retrying a dead token. It falls back to the `claude` CLI only in the narrow window where Claude Code will actually rotate the token.
+OpenCode's native Anthropic provider handles prompt conversion and streaming. Session hooks add the Claude Code identity, set `Authorization: Bearer` (and strip `x-api-key`), translate tool names, and process responses. **New imports use managed credentials:** OpenCode's resolved credential is authoritative, not the original Claude file or Keychain entry. Refreshes exchange only that credential's refresh token through Anthropic's OAuth endpoint (zero LLM tokens consumed). Existing v1 imports retain the legacy source-sync behavior until explicitly re-imported.
 
 ## Alternative: CLIProxyAPI (plugin not required)
 
@@ -84,6 +84,38 @@ See [installation.md](installation.md) for step-by-step agent instructions.
 
 Run `/connect` once to import your Claude Code subscription, then use OpenCode normally — the plugin refreshes credentials automatically and provides them to the Anthropic API. If your credentials aren't OAuth-based, the connection falls through to standard API key auth.
 
+## Managed credentials (this fork)
+
+New `/connect` imports require an explicit source selection, even for one account. Select **Credentials file** and optionally enter an **absolute Claude config directory** to import an account-specific `.credentials.json`. Blank means the discovered/default directory (`CLAUDE_CONFIG_DIR`, otherwise `~/.claude`). The selected source is read freshly; a missing/unreadable source is an error, never a reason to import another account or cached tokens. Import does not refresh, run Claude, or write the source.
+
+After import:
+
+- Every request uses only the resolved OpenCode credential's access token. Switching A → B → A takes effect on the next request without the legacy 30-second source cache.
+- Refresh exchanges only the input credential's refresh token, preserves its metadata, and returns the result to OpenCode for persistence. No source re-read, write-back, account borrowing, or CLI fallback occurs.
+- 401/429 responses do not trigger source adoption or forced refresh. Errors stay with that account. Permitted beta-repair/transport retries retain the starting request's token; a pending A response cannot change B.
+- Concurrent refreshes of the same refresh token share one exchange **within this plugin process**; different tokens are independent even when both came from `source: "file"`. There is no cross-process managed refresh lock or result store. Do not run independent servers against copies of the same refresh token.
+
+**Shared refresh-token warning:** import copies credentials; it does not mint an independent session. Claude CLI and OpenCode may initially share a rotating refresh token. Either may invalidate the other's copy. Prefer separately authenticated sessions/config directories, avoid simultaneous use of a shared token, and re-authenticate/re-import explicitly when required. Managed mode intentionally does not repair this by adopting a different account. A transient failure should be retried later; an invalid grant may require re-authentication and `/connect` again.
+
+### Metadata contract for dashboards
+
+`isManagedClaudeCredential({ metadata })` is exported from the package and returns true **only** when both exact entries exist:
+
+```json
+{
+  "opencode-claude-auth/claude-code-oauth": "v2",
+  "credentialAuthority": "opencode"
+}
+```
+
+The marker is inside the OpenCode OAuth credential's `metadata`; `source`, `configDir`, `label`, and `subscriptionType` are provenance/display fields, not authority or account identity. For an Anthropic connection also verify `type: "oauth"` and `methodID: "claude-code"`. v1, missing markers, and v2 without the authority entry are **not managed**. Dashboards must label/block legacy credentials from managed multi-account workflows rather than silently promote them. Malformed v2 refreshes fail closed.
+
+### Migration and rollback
+
+- Existing v1 credentials are **never automatically upgraded**. They keep source reads, write-back, CLI fallback and borrowing. Re-import each chosen account to create a managed credential, then explicitly activate that connection in OpenCode.
+- To roll back, stop using managed connections, restore the previous plugin version/configuration, and explicitly re-authenticate/re-import using that version. Do not merely rewrite v2 metadata to v1: the original shared refresh token may already be stale. This branch does not replace any installed plugin or change an OpenCode service.
+- Source files are unchanged by managed import/request/refresh. There is no automatic merge of OpenCode's rotated tokens back into Claude's store.
+
 ## Migrating from OpenCode 1
 
 OpenCode 2 replaced the plugin and auth APIs this plugin used under OpenCode 1, so 3.0.0 and later only load on OpenCode 2.
@@ -141,9 +173,9 @@ The plugin checks these in order:
 
 If you have [multiple Claude Code accounts](https://gist.github.com/KMJ-007/0979814968722051620461ab2aa01bf2) authenticated on macOS, they're all detected from the Keychain automatically and offered as a selection prompt when you run `/connect`. Each account is labeled by its subscription tier (Claude Pro, Claude Max, etc.).
 
-To switch accounts, re-run `/connect` and pick a different one. Your selection is persisted across sessions.
+To import another account, re-run `/connect` and pick its source or config directory. Switch the active credential using OpenCode; managed requests follow that resolved selection.
 
-If only one account is found, the selection prompt is skipped and the plugin uses it directly.
+Even if only one account is found, explicitly select its source. A vanished selection is an error, not a fallback to the first account.
 
 ## Troubleshooting
 
@@ -151,12 +183,12 @@ If only one account is found, the selection prompt is skipped and the plugin use
 | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | "Credentials not found"                                                               | Run `claude` to authenticate with Claude Code first                                                                                                                                                           |
 | "Keychain is locked"                                                                  | Run `security unlock-keychain ~/Library/Keychains/login.keychain-db`                                                                                                                                          |
-| "Token expired and refresh failed"                                                    | The plugin runs `claude` CLI to refresh automatically. If this fails, re-authenticate manually by running `claude`                                                                                            |
+| "Token expired and refresh failed"                                                    | Managed: retry later or re-authenticate and explicitly re-import with `/connect`. Legacy v1 may run the CLI fallback. |
 | Not working on Linux/Windows                                                          | Ensure `~/.claude/.credentials.json` exists (or `$CLAUDE_CONFIG_DIR/.credentials.json` if that env var is set). Run `claude` to create it                                                                     |
 | Keychain access denied                                                                | Grant access when macOS prompts you                                                                                                                                                                           |
 | Keychain read timed out                                                               | Restart Keychain Access (can happen on macOS Tahoe)                                                                                                                                                           |
 | "Credentials are unavailable or expired"                                              | Run `claude` to refresh your Claude Code credentials                                                                                                                                                          |
-| Auth keeps failing right after re-authenticating with `claude`                        | OpenCode may still be holding a refresh token from a previous `/connect` that's now stale. The plugin re-syncs from the keychain automatically on the next refresh; if it's still stuck, run `/connect` again |
+| Auth keeps failing right after re-authenticating with `claude`                        | Managed: explicitly re-import with `/connect`; the plugin never adopts the CLI's replacement automatically. Legacy v1 still re-syncs from the source. |
 | "Extra usage is required for long context requests"                                   | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                       |
 | Plugin not updating to latest version                                                 | Delete the cached package: `rm -rf ~/.cache/opencode/packages/opencode-claude-auth@latest/` then restart OpenCode                                                                                             |
 | `opencode auth login` prints "Only http and https links can be opened in the browser" | Harmless: importing has no browser step, but the CLI tries to open one anyway. The credential is still saved — confirm with `opencode auth list`                                                              |
@@ -198,7 +230,9 @@ pnpm run validate:oauth           # refresh + write-back (safe, keeps credential
 pnpm run validate:oauth -- --dry-run  # show what would be sent without making the request
 ```
 
-This reads your stored credentials, calls Anthropic's OAuth token endpoint, and writes the new tokens back to storage. Refresh tokens rotate on each use, so write-back is enabled by default to keep your stored credentials valid.
+**Legacy/live diagnostic only — not an isolated managed-mode test.** This reads your stored credentials, calls Anthropic's OAuth token endpoint, and writes the new tokens back to storage. Refresh tokens rotate on each use, so write-back is enabled by default to keep your stored credentials valid. Do not run this to verify managed credential isolation.
+
+For offline verification, run `node scripts/test-isolated.mjs` (or `pnpm test`). It gives every test worker fake HOME, USERPROFILE, CLAUDE_CONFIG_DIR, APPDATA, LOCALAPPDATA, XDG and temp/lock directories, and blocks unfaked network/subprocess calls. `node scripts/build.mjs` builds on Windows and Unix. Live model/headless/OAuth scripts are separate and are not part of this runner.
 
 ## Environment variable overrides
 
@@ -232,11 +266,12 @@ export ANTHROPIC_CLI_VERSION=2.2.0
 - Injects the Claude Code identity into system prompts via the `context`, `compaction`, `generate`, and `title` session hooks — OpenCode 2 dispatches a separate hook per request kind, and all four bill to the connected subscription
 - On macOS, enumerates all `Claude Code-credentials*` Keychain entries and labels them by subscription tier; multiple accounts are offered as a selection prompt during `/connect`
 - OpenCode persists the resulting OAuth credential (access + refresh token) itself and calls back into the plugin's `refresh` hook whenever it decides one is needed — the plugin doesn't run its own background timer
-- Before ever attempting a network refresh, re-reads the keychain directly and adopts whatever is there if it differs from the token OpenCode handed back. This keeps things working if `claude` rotated credentials independently of this connection (an interactive re-login, its own periodic refresh, ...) — otherwise OpenCode would keep retrying the same now-dead refresh token on every call, forever
-- OpenCode's `refresh` callback and the request path share one in-flight refresh per account behind a cross-process lock, so they never spend the same single-use refresh token twice
-- Refreshes directly via `POST https://claude.ai/v1/oauth/token` using the runtime's own `fetch` (no LLM tokens consumed, no subprocess); falls back to the `claude` CLI only within the window where Claude Code will actually rotate the token, and writes new tokens back to Keychain (macOS) or the credentials file (Linux/Windows) to keep stored credentials in sync
+- Managed v2 refresh bypasses all legacy account state and directly exchanges the input refresh token; see [Managed credentials](#managed-credentials-this-fork)
+- **Legacy v1 only:** before network refresh, re-reads the source and adopts an externally rotated token
+- **Legacy v1 only:** the refresh callback and request path share an account-scoped refresh behind a source-based cross-process lock
+- **Legacy v1 only:** direct OAuth refresh may fall back to the `claude` CLI and write tokens back to Keychain or the credentials file
 - Retries API requests on 429 (rate limit) and 529 (overloaded) with exponential backoff, respecting `retry-after` headers
-- On a 401, recovers in place rather than surfacing it: adopts an externally rotated token if the keychain now holds one, otherwise forces an OAuth refresh, then retries the request
+- **Legacy v1 only:** on 401/429, may adopt source tokens or force OAuth refresh and retry; managed credentials surface the account's error without source recovery
 - If credentials aren't OAuth-based, the connection falls through to standard API key auth
 - If credentials are unavailable or unreadable, the plugin logs the error and OpenCode continues without a Claude Code auth connection
 
