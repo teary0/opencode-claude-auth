@@ -97,6 +97,7 @@ describe("native provider HTTP hooks", () => {
     }
     let resolves = 0
     const ctx = {
+      rpc: { register: async () => ({ dispose: () => {} }) },
       integration: {
         transform: async () => {},
         connection: {
@@ -110,6 +111,7 @@ describe("native provider HTTP hooks", () => {
       provider: { transform: async () => {}, reload: async () => {} },
       event: { subscribe: async function* () {} },
       session: {
+        get: async () => ({ metadata: {} }),
         hook: async (kind: string, hook: any) => {
           hooks.set(kind, hook)
         },
@@ -127,6 +129,7 @@ describe("native provider HTTP hooks", () => {
     }
     try {
       const eventA = {
+        sessionID: "ses_a",
         model: { providerID: "anthropic" },
         request: nativeRequest(),
       }
@@ -149,6 +152,7 @@ describe("native provider HTTP hooks", () => {
       ])
       setActiveAccountSource("file")
       const eventB = {
+        sessionID: "ses_b",
         model: { providerID: "anthropic" },
         request: nativeRequest(),
       }
@@ -204,6 +208,7 @@ describe("native provider HTTP hooks", () => {
     }
     const model = { package: "@opencode/ai/providers/anthropic", cost: [1] }
     const ctx = {
+      rpc: { register: async () => ({ dispose: () => {} }) },
       integration: {
         transform: async () => {},
         connection: {
@@ -229,6 +234,7 @@ describe("native provider HTTP hooks", () => {
       },
       event: { subscribe: async function* () {} },
       session: {
+        get: async () => ({ metadata: {} }),
         hook: async (kind: string, hook: (event: any) => Promise<void>) => {
           hooks.set(kind, hook)
         },
@@ -239,6 +245,7 @@ describe("native provider HTTP hooks", () => {
       assert.equal(provider.package, "@opencode/ai/providers/anthropic")
       assert.equal(model.package, "@opencode/ai/providers/anthropic")
       const event = {
+        sessionID: "ses_native",
         model: { providerID: "anthropic" },
         request: nativeRequest(),
       }

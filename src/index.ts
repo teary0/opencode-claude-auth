@@ -24,12 +24,18 @@ import {
   prepareClaudeRequest,
   type ClaudeRequestContext,
 } from "./provider.ts"
+import {
+  createSessionCredentialSelector,
+  SESSION_CREDENTIAL_RPC,
+  SESSION_CREDENTIAL_CAPABILITIES,
+} from "./session-credentials.ts"
 
 export * from "./betas.ts"
 export * from "./credentials.ts"
 export * from "./oauth-method.ts"
 export * from "./provider.ts"
 export * from "./signing.ts"
+export * from "./session-credentials.ts"
 export * from "./transforms.ts"
 
 const PROVIDER_ID = Provider.ID.make("anthropic")
@@ -96,6 +102,21 @@ export const ClaudeAuthPlugin = Plugin.define({
       draft.method.update(oauth(accounts))
     })
 
+    const sessionCredentials = createSessionCredentialSelector(
+      {
+        getSession: (sessionID) => ctx.session.get({ sessionID }),
+        getConnections: async () =>
+          (await ctx.integration.get({ integrationID: INTEGRATION_ID })).data
+            .connections,
+        resolveConnection: (connection) =>
+          ctx.integration.connection.resolve(connection),
+      },
+      () => Date.now(),
+    )
+    await ctx.rpc.register(SESSION_CREDENTIAL_RPC, {
+      capabilities: async () => ({ ...SESSION_CREDENTIAL_CAPABILITIES }),
+    })
+
     // The Anthropic integration keeps its built-in API-key method alongside
     // the subscription method registered above, so only OAuth usage is free.
     const hasSubscriptionConnection = async (): Promise<boolean> => {
@@ -138,6 +159,11 @@ export const ClaudeAuthPlugin = Plugin.define({
         signal: watcher.signal,
       })) {
         if (
+          event.type === "session.metadata.updated" ||
+          event.type === "session.deleted"
+        )
+          sessionCredentials.invalidate()
+        if (
           event.type === "credential.updated" ||
           (event.type === "credential.switched" &&
             event.data.integrationID === INTEGRATION_ID)
@@ -153,8 +179,10 @@ export const ClaudeAuthPlugin = Plugin.define({
     })
 
     for (const kind of IDENTITY_REQUEST_HOOKS)
-      await ctx.session.hook(kind, (event) => {
-        if (subscription) injectClaudeIdentity(event)
+      await ctx.session.hook(kind, async (event) => {
+        if (event.model.providerID !== PROVIDER_ID) return
+        const pinned = await sessionCredentials.credentialID(event.sessionID)
+        if (pinned !== undefined || subscription) injectClaudeIdentity(event)
       })
 
     // OpenCode's native Anthropic provider owns prompt conversion and streaming.
@@ -162,9 +190,17 @@ export const ClaudeAuthPlugin = Plugin.define({
     const requests = new WeakMap<Request, ClaudeRequestContext>()
     await ctx.session.hook("http.request", async (event) => {
       if (event.model.providerID !== PROVIDER_ID) return
-      const connection = await ctx.integration.connection.active(INTEGRATION_ID)
-      if (!connection) return
-      const credential = await ctx.integration.connection.resolve(connection)
+      // Do not activate the pin globally. Resolve refreshes this credential even
+      // when another connection is active, and errors never fall back to it.
+      let credential = await sessionCredentials.select(event.sessionID)
+      if (!credential) {
+        const connection =
+          await ctx.integration.connection.active(INTEGRATION_ID)
+        if (!connection) return
+        const resolved = await ctx.integration.connection.resolve(connection)
+        if (resolved?.type !== "oauth") return
+        credential = resolved
+      }
       if (
         credential?.type !== "oauth" ||
         credential.methodID !== METHOD_ID ||
