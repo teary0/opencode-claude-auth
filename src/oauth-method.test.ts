@@ -1,5 +1,8 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { Integration } from "@opencode/plugin"
 import type { ClaudeAccount } from "./keychain.ts"
 import {
   authorizeOAuth,
@@ -96,7 +99,7 @@ describe("oauthMethodDescriptor", () => {
     ])
     // A chooser is a `string` field carrying `options`; OpenCode has no
     // `select` field type, and a field without `options` renders as free text.
-    assert.equal(descriptor.form?.length, 2)
+    assert.equal(descriptor.form?.length, 3)
     const field = descriptor.form?.[0]
     assert.equal(field?.type, "string")
     assert.equal(field?.key, "account")
@@ -108,7 +111,8 @@ describe("oauthMethodDescriptor", () => {
       {
         value: "file",
         label: "Credentials file",
-        description: "Default or explicit Claude config directory",
+        description:
+          "Use an existing Claude Code login from a credentials file.",
       },
     ])
     // Without `custom` the host only accepts one of the listed accounts.
@@ -130,6 +134,52 @@ describe("oauthMethodDescriptor", () => {
       }),
       "b",
     )
+  })
+
+  it("defaults to the recommended location and asks for a path only for custom file imports", () => {
+    const descriptor = oauthMethodDescriptor([])
+    const [accountField, location, directory] = descriptor.form!
+    assert.equal(accountField.required, true)
+    assert.equal("default" in accountField, false)
+    assert.match(accountField.description!, /Sign in to Claude Code first/)
+    assert.equal(location.key, "configLocation")
+    assert.equal(location.type, "string")
+    assert.equal(location.required, true)
+    assert.deepEqual(location.when, [
+      { key: "account", op: "eq", value: "file" },
+    ])
+    assert.equal(location.type === "string" && location.default, "default")
+    assert.deepEqual(
+      location.type === "string" &&
+        location.options?.map(({ value, label }) => ({ value, label })),
+      [
+        { value: "default", label: "Use default location (recommended)" },
+        { value: "custom", label: "Use a different location" },
+      ],
+    )
+    assert.equal(directory.key, "configDir")
+    assert.equal(directory.required, true)
+    assert.deepEqual(directory.when, [
+      { key: "account", op: "eq", value: "file" },
+      { key: "configLocation", op: "eq", value: "custom" },
+    ])
+    assert.match(
+      directory.description!,
+      /folder containing .credentials.json, not the file/,
+    )
+    // The installed SDK schema validates and retains default/when. Rendering
+    // and conditional answer enforcement belong to the host, not this plugin.
+    const parsed = Integration.OAuthMethod.make(descriptor)
+    assert.deepEqual(parsed.form, descriptor.form)
+    for (const [index, field] of descriptor.form!.entries()) {
+      if ("when" in field)
+        for (const condition of field.when ?? [])
+          assert.ok(
+            descriptor
+              .form!.slice(0, index)
+              .some((earlier) => earlier.key === condition.key),
+          )
+    }
   })
 })
 
@@ -353,6 +403,222 @@ describe("authorizeOAuth", () => {
       () => authorizeOAuth({}, [], deps),
       /Select a Claude credential source explicitly/,
     )
+  })
+
+  it("shows and imports the same default: discovered folder, environment, then home", async () => {
+    const previous = process.env.CLAUDE_CONFIG_DIR
+    const root = process.env.OPENCODE_CLAUDE_AUTH_TEST_SANDBOX!
+    assert.ok(root, "must run through the isolated test runner")
+    try {
+      for (const scenario of [
+        {
+          discovered: join(root, "discovered"),
+          env: join(root, "env"),
+          expected: join(root, "discovered"),
+        },
+        {
+          discovered: undefined,
+          env: join(root, "env"),
+          expected: join(root, "env"),
+        },
+        {
+          discovered: undefined,
+          env: undefined,
+          expected: join(homedir(), ".claude"),
+        },
+      ]) {
+        if (scenario.env === undefined) delete process.env.CLAUDE_CONFIG_DIR
+        else process.env.CLAUDE_CONFIG_DIR = scenario.env
+        const accounts = scenario.discovered
+          ? [account({ source: "file", configDir: scenario.discovered })]
+          : []
+        const reads: unknown[] = []
+        const deps = makeDeps({
+          refreshAccountsList: () => accounts,
+          readStoredCredentials: (source, directory) => {
+            reads.push([source, directory])
+            return account().credentials
+          },
+        })
+        const location = oauthMethodDescriptor(accounts).form![1]
+        assert.equal(
+          location.type === "string" && location.options?.[0].description,
+          `Uses: ${scenario.expected}`,
+        )
+        for (const configDir of [
+          undefined,
+          join(root, "stale-custom"),
+          "relative",
+          "   ",
+          42,
+        ]) {
+          const value = await authorizeOAuth(
+            { account: "file", configLocation: "default", configDir },
+            [],
+            deps,
+          )
+          assert.equal(value.metadata?.configDir, scenario.expected)
+          assert.equal(value.metadata?.source, "file")
+          assert.equal(value.metadata?.credentialAuthority, "opencode")
+          assert.equal(
+            value.metadata?.[CLAUDE_CODE_OAUTH_METADATA_KEY],
+            MANAGED_CLAUDE_CODE_OAUTH_METADATA_VALUE,
+          )
+        }
+        assert.deepEqual(reads, Array(5).fill(["file", scenario.expected]))
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previous
+    }
+  })
+
+  it("uses a custom absolute folder ahead of discovery and the environment", async () => {
+    const root = process.env.OPENCODE_CLAUDE_AUTH_TEST_SANDBOX!
+    const directory = join(root, "custom")
+    const reads: unknown[] = []
+    const deps = makeDeps({
+      refreshAccountsList: () => [
+        account({ source: "file", configDir: join(root, "discovered") }),
+      ],
+      readStoredCredentials: (source, configDir) => {
+        reads.push([source, configDir])
+        return account().credentials
+      },
+    })
+    const value = await authorizeOAuth(
+      {
+        account: "file",
+        configLocation: "custom",
+        configDir: `  ${directory}  `,
+      },
+      [],
+      deps,
+    )
+    assert.deepEqual(reads, [["file", directory]])
+    assert.equal(value.metadata?.configDir, directory)
+    assert.equal(value.metadata?.label, "Claude Code subscription")
+    assert.equal(value.metadata?.source, "file")
+    assert.equal(value.metadata?.credentialAuthority, "opencode")
+  })
+
+  it("rejects blank, missing, non-string, and relative custom paths before reading any store", async () => {
+    const deps = makeDeps({
+      readStoredCredentials: () =>
+        assert.fail("invalid custom input read a store"),
+    })
+    for (const configDir of [undefined, "", "   ", "relative", "~/.claude", 42])
+      await assert.rejects(
+        () =>
+          authorizeOAuth(
+            { account: "file", configLocation: "custom", configDir },
+            [],
+            deps,
+          ),
+        /absolute path/,
+      )
+    for (const configLocation of ["other", "", 42, null])
+      await assert.rejects(
+        () => authorizeOAuth({ account: "file", configLocation }, [], deps),
+        /Choose a Claude Code credentials location/,
+      )
+  })
+
+  it("ignores hidden location answers for a non-file source", async () => {
+    const reads: unknown[] = []
+    const deps = makeDeps({
+      refreshAccountsList: () => [account({ source: "keychain" })],
+      readStoredCredentials: (source, configDir) => {
+        reads.push([source, configDir])
+        return account().credentials
+      },
+    })
+    for (const configDir of ["relative", 42]) {
+      const value = await authorizeOAuth(
+        { account: "keychain", configLocation: "custom", configDir },
+        [],
+        deps,
+      )
+      assert.equal(value.metadata?.source, "keychain")
+      assert.equal(value.metadata?.configDir, undefined)
+    }
+    assert.deepEqual(reads, [
+      ["keychain", undefined],
+      ["keychain", undefined],
+    ])
+  })
+
+  it("accepts older clients without a location field, preserving explicit paths", async () => {
+    const directory = join(
+      process.env.OPENCODE_CLAUDE_AUTH_TEST_SANDBOX!,
+      "legacy-custom",
+    )
+    const deps = makeDeps({
+      readStoredCredentials: () => account().credentials,
+    })
+    assert.equal(
+      (
+        await authorizeOAuth(
+          { account: "file", configDir: directory },
+          [],
+          deps,
+        )
+      ).metadata?.configDir,
+      directory,
+    )
+    for (const configDir of [undefined, "", "   "])
+      assert.equal(
+        (await authorizeOAuth({ account: "file", configDir }, [], deps))
+          .metadata?.configDir,
+        process.env.CLAUDE_CONFIG_DIR,
+      )
+    await assert.rejects(
+      () =>
+        authorizeOAuth({ account: "file", configDir: "relative" }, [], deps),
+      /absolute/,
+    )
+    await assert.rejects(
+      () => authorizeOAuth({ account: "file", configDir: 42 }, [], deps),
+      /must be a string/,
+    )
+  })
+
+  it("never falls back to another source or cached credentials after a selected source fails", async () => {
+    for (const failure of ["missing", "unreadable"]) {
+      const reads: unknown[] = []
+      const deps = makeDeps({
+        refreshAccountsList: () => [account({ source: "other" })],
+        getCachedCredentials: async () =>
+          assert.fail("used cached credentials"),
+        readStoredCredentials: (source, directory) => {
+          reads.push([source, directory])
+          if (failure === "unreadable") throw new Error("private store error")
+          return null
+        },
+      })
+      for (const inputs of [
+        { account: "file", configLocation: "default" },
+        {
+          account: "file",
+          configLocation: "custom",
+          configDir: join(
+            process.env.OPENCODE_CLAUDE_AUTH_TEST_SANDBOX!,
+            "missing",
+          ),
+        },
+        { account: "missing-keychain" },
+      ])
+        await assert.rejects(
+          () => authorizeOAuth(inputs, [], deps),
+          /Selected Claude credential source is (unavailable|unreadable)/,
+        )
+      assert.deepEqual(
+        reads.map((read) => (read as unknown[])[0]),
+        ["file", "file", "missing-keychain"],
+      )
+      assert.deepEqual(deps.calls.setActiveAccountSource, [])
+      assert.deepEqual(deps.calls.saveAccountSource, [])
+    }
   })
 })
 

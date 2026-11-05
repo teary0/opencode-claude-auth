@@ -315,7 +315,7 @@ describe("managed credential authority", () => {
     })
     writeFileSync(file, bytes)
     const value = await oauth.authorizeOAuth(
-      { account: "file", configDir: directory },
+      { account: "file", configLocation: "custom", configDir: directory },
       [],
       oauth.realOAuthDeps,
     )
@@ -327,7 +327,7 @@ describe("managed credential authority", () => {
     await assert.rejects(
       () =>
         oauth.authorizeOAuth(
-          { account: "file", configDir: directory },
+          { account: "file", configLocation: "custom", configDir: directory },
           [],
           oauth.realOAuthDeps,
         ),
@@ -340,11 +340,43 @@ describe("managed credential authority", () => {
     await assert.rejects(
       () =>
         oauth.authorizeOAuth(
-          { account: "file", configDir: "relative" },
+          { account: "file", configLocation: "custom", configDir: "relative" },
           [],
           oauth.realOAuthDeps,
         ),
       /absolute/,
     )
+  })
+
+  it("imports the default fixture without a path, ignores a stale custom answer, and leaves the source unchanged", async () => {
+    const directory = process.env.CLAUDE_CONFIG_DIR!
+    const file = join(directory, ".credentials.json")
+    const bytes = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "default-import",
+        refreshToken: "default-refresh",
+        expiresAt: Date.now() + 3600000,
+      },
+    })
+    writeFileSync(file, bytes)
+    const counts = (globalThis as any).__isolatedTestCalls
+    const before = { ...counts }
+    initAccounts([])
+    const value = await oauth.authorizeOAuth(
+      {
+        account: "file",
+        configLocation: "default",
+        configDir: "stale-relative-path",
+      },
+      [],
+      oauth.realOAuthDeps,
+    )
+    assert.equal(value.access, "default-import")
+    assert.equal(value.metadata?.configDir, directory)
+    assert.equal(value.metadata?.source, "file")
+    assert.equal(value.metadata?.credentialAuthority, "opencode")
+    assert.equal(oauth.isManagedClaudeCredential(value), true)
+    assert.equal(readFileSync(file, "utf8"), bytes)
+    assert.deepEqual(counts, before)
   })
 })

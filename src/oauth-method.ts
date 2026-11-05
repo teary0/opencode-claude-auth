@@ -76,7 +76,17 @@ export interface OAuthDeps {
 /** A `Form.Answer` as the host collected it from {@link oauthMethodDescriptor}. */
 export interface AuthorizeInputs {
   readonly account?: unknown
+  readonly configLocation?: unknown
   readonly configDir?: unknown
+}
+
+/** Keep the displayed default and the imported file location in sync. */
+function defaultConfigDir(account?: ClaudeAccount | null): string {
+  return (
+    account?.configDir ??
+    process.env.CLAUDE_CONFIG_DIR ??
+    join(homedir(), ".claude")
+  )
 }
 
 /**
@@ -103,7 +113,7 @@ export function oauthMethodDescriptor(
     options.push({
       value: "file",
       label: "Credentials file",
-      description: "Default or explicit Claude config directory",
+      description: "Use an existing Claude Code login from a credentials file.",
     })
   return {
     ...method,
@@ -112,15 +122,43 @@ export function oauthMethodDescriptor(
         type: "string",
         key: ACCOUNT_FIELD_KEY,
         title: "Select a Claude Code account",
+        description:
+          "Sign in to Claude Code first, then select the account to import.",
         required: true,
         options,
       },
       {
         type: "string",
+        key: "configLocation",
+        title: "Where are your Claude Code credentials?",
+        description: "Usually no folder path is needed.",
+        required: true,
+        default: "default",
+        when: [{ key: ACCOUNT_FIELD_KEY, op: "eq", value: "file" }],
+        options: [
+          {
+            value: "default",
+            label: "Use default location (recommended)",
+            description: `Uses: ${defaultConfigDir(accounts.find((account) => account.source === "file"))}`,
+          },
+          {
+            value: "custom",
+            label: "Use a different location",
+            description: "For a separate Claude Code setup or another account.",
+          },
+        ],
+      },
+      {
+        type: "string",
         key: "configDir",
-        title:
-          "Claude config directory (file source only; absolute path, blank for default)",
-        required: false,
+        title: "Claude Code folder (absolute path)",
+        description:
+          "Enter the full path to the folder containing .credentials.json, not the file itself.",
+        required: true,
+        when: [
+          { key: ACCOUNT_FIELD_KEY, op: "eq", value: "file" },
+          { key: "configLocation", op: "eq", value: "custom" },
+        ],
       },
     ],
   }
@@ -141,8 +179,10 @@ export async function buildOAuthCredential(
   explicitConfigDir?: string,
 ): Promise<Credential.OAuth> {
   if (
-    explicitConfigDir &&
-    (source !== "file" || !isAbsolute(explicitConfigDir))
+    explicitConfigDir !== undefined &&
+    (source !== "file" ||
+      !explicitConfigDir.trim() ||
+      !isAbsolute(explicitConfigDir))
   )
     throw new Error(
       "Choose the file source with an absolute Claude config directory.",
@@ -150,10 +190,7 @@ export async function buildOAuthCredential(
   const known = deps.getAccountBySource(source)
   const configDir =
     source === "file"
-      ? (explicitConfigDir ??
-        known?.configDir ??
-        process.env.CLAUDE_CONFIG_DIR ??
-        join(homedir(), ".claude"))
+      ? (explicitConfigDir ?? defaultConfigDir(known))
       : known?.configDir
   let value: ClaudeCredentials | null
   try {
@@ -198,6 +235,21 @@ export async function authorizeOAuth(
   const source = resolveAuthorizeSource(inputs, fallbackAccounts, deps)
   if (!source)
     throw new Error("Select a Claude credential source explicitly in /connect.")
+  // Conditional form fields may leave old answers behind after a user changes
+  // their selection. Never let those answers redirect a non-file/default import.
+  if (source !== "file" || inputs.configLocation === "default")
+    return buildOAuthCredential(source, deps)
+  if (inputs.configLocation === "custom") {
+    const directory =
+      typeof inputs.configDir === "string" ? inputs.configDir.trim() : ""
+    if (!directory || !isAbsolute(directory))
+      throw new Error("Enter an absolute path to the Claude Code folder.")
+    return buildOAuthCredential(source, deps, directory)
+  }
+  if (inputs.configLocation !== undefined)
+    throw new Error("Choose a Claude Code credentials location in /connect.")
+  // Older clients send only configDir: retain their explicit-path / blank-default
+  // behavior, without weakening validation for the new custom-location mode.
   if (inputs.configDir !== undefined && typeof inputs.configDir !== "string")
     throw new Error("Claude config directory must be a string.")
   return buildOAuthCredential(

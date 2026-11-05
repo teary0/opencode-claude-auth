@@ -86,7 +86,9 @@ Run `/connect` once to import your Claude Code subscription, then use OpenCode n
 
 ## Managed credentials (this fork)
 
-New `/connect` imports require an explicit source selection, even for one account. Select **Credentials file** and optionally enter an **absolute Claude config directory** to import an account-specific `.credentials.json`. Blank means the discovered/default directory (`CLAUDE_CONFIG_DIR`, otherwise `~/.claude`). The selected source is read freshly; a missing/unreadable source is an error, never a reason to import another account or cached tokens. Import does not refresh, run Claude, or write the source.
+Sign in to Claude Code before importing. New `/connect` imports require an explicit source selection, even for one account. For file-based credentials, select **Credentials file** (or the discovered file account), then **Use default location (recommended)** — no folder path is needed. The option shows the directory that will be used: the discovered file account's directory, then `CLAUDE_CONFIG_DIR`, otherwise `~/.claude`.
+
+For a separate Claude Code setup or another account, select **Use a different location** and enter the absolute path to the **folder containing `.credentials.json`**, not the file itself. Only this choice asks for a path; other credential sources skip the location questions. The selected source is read freshly; a missing/unreadable source is an error, never a reason to import another account or cached tokens. Import does not refresh, run Claude, or write the source.
 
 After import:
 
